@@ -23,7 +23,7 @@ def _install_custom_deps():
     if "--no-install" in sys.argv:
         return
 
-    TRITON_WHEEL_URL = "https://github.com/wychi/wheels/releases/download/v0.2.0/triton-3.7.0+gitb7fa781f-cp313-cp313-linux_x86_64.whl"
+    TRITON_WHEEL_URL = "https://github.com/wychi/wheels/raw/refs/heads/main/gpumode/triton-3.7.0+gitb7fa781f-cp313-cp313-linux_x86_64.whl"
     UTLX_WHEEL_URL = "https://github.com/plotfi/plotfi-wheels/raw/main/utlx-0.1.0-py3-none-any.whl"
 
     print(f"[DEBUG] Python: {sys.version}", file=sys.stderr)
