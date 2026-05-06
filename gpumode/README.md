@@ -10,18 +10,11 @@
 - **Triton commit**: b7fa781f9 (`release/3.7.x` HEAD, `Split RemoveLayoutConversions cleanup so scf.if non-convergence is non fatal (#10174)`)
 - **LLVM commit**: ac5dc54d5091 (from `cmake/llvm-hash.txt`)
 
-## Patches (on top of b4e20bbe5)
+## Patches (on top of b7fa781f9)
 
-1. **`CMakeLists.txt`**: Add `-Wno-attributes` to suppress attribute warnings during build
-2. **`python/src/ir.cc`**: Fix plugin op builder to support return values — inserts a placeholder `Value()` at `args[0]` before calling `op.addOp`, then returns `args[0]` as the result. This is required for uTLX plugin ops that produce output values.
+1. **`python/src/ir.cc`**: Fix plugin op builder to support return values — inserts a placeholder `Value()` at `args[0]` before calling `op.addOp`, then returns `args[0]` as the result. This is required for uTLX plugin ops that produce output values.
 
 ```diff
---- a/CMakeLists.txt
-+++ b/CMakeLists.txt
-@@ -160,7 +160,7 @@
--    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DTRITON_EXT_ENABLED=1")
-+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DTRITON_EXT_ENABLED=1 -Wno-attributes")
-
 --- a/python/src/ir.cc
 +++ b/python/src/ir.cc
 @@ -1872,7 +1872,9 @@
@@ -32,6 +25,8 @@
 +            return args[0];
            });
 ```
+
+**Build flag**: Must build with `-DTRITON_EXT_ENABLED=ON` to enable plugin loading.
 
 ## Build Environment
 - **CUDA ptxas**: 12.8.93 (Hopper), 13.1.80 (Blackwell)
@@ -73,7 +68,7 @@ export TRITON_CUDART_PATH=/usr/local/cuda-13.1/
 export TRITON_CUPTI_PATH=/usr/local/cuda-12.8/
 export TRITON_BUILD_UT=OFF
 export TRITON_BUILD_PROTON=OFF
-export TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=OFF"
+export TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=OFF -DTRITON_EXT_ENABLED=ON"
 python -m build --wheel --no-isolation
 
 # 4. Output
