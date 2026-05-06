@@ -1,14 +1,37 @@
 # Triton Wheel Build Info
 
-- **Wheel**: triton-3.7.0+gitb4e20bbe-cp313-cp313-linux_x86_64.whl
+- **Wheel**: triton-3.7.0+gitb7fa781f-cp313-cp313-linux_x86_64.whl
 - **Built**: 2026-05-06
 - **Python**: CPython 3.13.13 (uv managed)
 - **Platform**: linux-x86_64
 
 ## Source
 - **Triton repo**: https://github.com/triton-lang/triton.git
-- **Triton commit**: b4e20bbe5 (`release/3.7.x (#9965)`)
+- **Triton commit**: b7fa781f9 (`release/3.7.x` HEAD, `Split RemoveLayoutConversions cleanup so scf.if non-convergence is non fatal (#10174)`)
 - **LLVM commit**: ac5dc54d5091 (from `cmake/llvm-hash.txt`)
+
+## Patches (on top of b4e20bbe5)
+
+1. **`CMakeLists.txt`**: Add `-Wno-attributes` to suppress attribute warnings during build
+2. **`python/src/ir.cc`**: Fix plugin op builder to support return values — inserts a placeholder `Value()` at `args[0]` before calling `op.addOp`, then returns `args[0]` as the result. This is required for uTLX plugin ops that produce output values.
+
+```diff
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -160,7 +160,7 @@
+-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DTRITON_EXT_ENABLED=1")
++    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DTRITON_EXT_ENABLED=1 -Wno-attributes")
+
+--- a/python/src/ir.cc
++++ b/python/src/ir.cc
+@@ -1872,7 +1872,9 @@
+       TritonOpBuilderBinding.def(
+           op.name, [op](TritonOpBuilder &self, std::vector<Value> args) {
++            args.insert(args.begin(), Value());
+             op.addOp(self, args);
++            return args[0];
+           });
+```
 
 ## Build Environment
 - **CUDA ptxas**: 12.8.93 (Hopper), 13.1.80 (Blackwell)
