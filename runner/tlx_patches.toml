@@ -25,5 +25,6 @@ patches = [
     "broadcast_shape_overload",
     "gluon_op_builder_swap",
     "async_load_native",
+    "wgmma_acc_layout_setup",
     "warp_specialize_codegen",
 ]

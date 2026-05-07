@@ -695,6 +695,186 @@ def _async_load_native() -> None:
     _utlx_mem_ops.async_load_wait_group = _patched_wait_group
 
 
+@register("wgmma_acc_layout_setup")
+def _wgmma_acc_layout_setup() -> None:
+    """Replace `tlx.async_dot`'s `utlx_require_nv_mma_layout(acc)` step with a
+    direct splat of zero into a tensor with the correct `#mma` encoding.
+
+    The plugin's `tlx.require_layout` marker on the acc edge survives the
+    `utlx_convert_triton_to_tritongpu` pass as an
+    `unrealized_conversion_cast` from `#blocked` (added to the source
+    `arith.constant` by the dialect conversion) to no-encoding (the marker's
+    declared input type). The pass has no rewrite rule that absorbs this
+    cast, so it remains live and the verifier rejects it. Bypassing the
+    marker by emitting acc with the right encoding from the start avoids the
+    materialization entirely.
+
+    **Trade-off — single-shot acc only.** This patch always splats zero into
+    the mma-typed acc, discarding the input acc value. That is correct for
+    fresh-zero accumulators (`acc = tl.zeros(...); tlx.async_dot(a, b, acc)`)
+    because `use_acc=True` then computes `0 + a*b = a*b`. Loop accumulators
+    where `acc` carries forward across iterations would have their previous
+    values silently dropped. Loop kernels need a different patch (or the
+    wheel rebuild proper).
+
+    Layout selection mirrors `triton.tools.triton_to_gluon_translator.
+    hopper_helpers._mmav3_acc_layout`.
+
+    Retire when: the wheel's `mma_ops.async_dot` builds the mma-encoded acc
+    directly (e.g. via gluon's `warpgroup_mma_init` pattern), or the
+    conversion pass learns to absorb `tlx.require_layout`.
+
+    Must run after `gluon_op_builder_swap` (relies on `_semantic.builder`
+    being a `GluonOpBuilder` for `get_mma_layout` / `get_distributed_ty`).
+    """
+    import functools
+    import re
+
+    import triton.language as tl
+    import triton.language.core as tl_core
+    import utlx_plugin
+    import utlx_plugin.mma_ops as _mma_ops
+    from utlx_plugin.mma_ops import (require_nv_mma_shared_layout,
+                                     require_dot_operand_layout)
+
+    def _cuda_capability(arch):
+        m = re.fullmatch(r"sm(\d+)", str(arch))
+        if not m:
+            raise ValueError(f"unexpected arch {arch!r}")
+        return int(m.group(1))
+
+    # Hopper wgmma N-tile candidates, mirroring _mmav3_acc_layout.
+    _VALID_N_FP = [
+        256, 248, 240, 232, 224, 216, 208, 200, 192, 184, 176, 168, 160, 152,
+        144, 136, 128, 120, 112, 104, 96, 88, 80, 72, 64, 56, 48, 40, 32, 24,
+        16, 8
+    ]
+    _VALID_N_INT = [
+        224, 208, 192, 176, 160, 144, 128, 112, 96, 80, 64, 48, 32, 24, 16, 8
+    ]
+
+    def _mmav3_instr_and_warps(num_warps, c_shape, a_dtype):
+        k = 256 // a_dtype.primitive_bitwidth
+        valid_n = _VALID_N_FP if a_dtype.is_floating() else _VALID_N_INT
+        m = 16
+        m_warps = max(c_shape[0] // m, 1)
+        n_warps_cap = max(num_warps // m_warps, 1)
+        max_n = max(c_shape[1] // n_warps_cap, 8)
+        instr_shape = None
+        for n in valid_n:
+            if c_shape[1] % n == 0 and n <= max_n:
+                instr_shape = [m, n, k]
+                break
+        if instr_shape is None:
+            raise RuntimeError(
+                f"no valid wgmma instr shape for c_shape={c_shape}, "
+                f"a_dtype={a_dtype}, num_warps={num_warps}")
+        warps_per_tile = [4, 1]
+        shape_per_warp = [16, instr_shape[1]]
+        while True:
+            if warps_per_tile[0] * warps_per_tile[1] >= num_warps:
+                break
+            if c_shape[0] > shape_per_warp[0] * warps_per_tile[0]:
+                warps_per_tile[0] *= 2
+            else:
+                warps_per_tile[1] *= 2
+        return instr_shape, warps_per_tile
+
+    @tl_core.builtin
+    @functools.wraps(utlx_plugin.async_dot)
+    def _patched_async_dot(A,
+                           B,
+                           acc=None,
+                           use_acc=None,
+                           pred=None,
+                           mBarriers=None,
+                           two_ctas=False,
+                           force_async=False,
+                           input_precision=None,
+                           out_dtype=tl.float32,
+                           _semantic=None):
+        if mBarriers is None:
+            mBarriers = []
+        (A, B, acc_handle, input_precision, max_num_imprecise_acc,
+         ret_ty) = _semantic.dot_precheck(A, B, acc, input_precision, None,
+                                          None, out_dtype, two_ctas)
+        assert A.shape[0] >= 64, "M must be at least 64"
+        assert A.shape[1] >= 16, "K must be at least 16"
+        assert B.shape[1] >= 32, "N must be at least 32"
+
+        capability = _cuda_capability(_semantic.builder.options.arch)
+        if capability >= 100:
+            # Blackwell tcgen05 path — fall through to original impl.
+            return utlx_plugin.async_dot.__wrapped__(  # type: ignore[attr-defined]
+                A,
+                B,
+                acc,
+                use_acc=use_acc,
+                pred=pred,
+                mBarriers=mBarriers,
+                two_ctas=two_ctas,
+                force_async=force_async,
+                input_precision=input_precision,
+                out_dtype=out_dtype,
+                _semantic=_semantic)
+
+        # Hopper wgmma path.
+        if isinstance(A, utlx_plugin.buffered_tensor) and \
+                A.type.storage == utlx_plugin.storage_kind.smem:
+            A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder)
+        else:
+            assert isinstance(A, tl.tensor)
+            A_handle = A.handle
+        B_handle = require_nv_mma_shared_layout(B, True, _semantic.builder)
+
+        builder = _semantic.builder
+        num_warps = builder.options.num_warps
+        c_shape = list(ret_ty.shape)
+        a_dtype = A.dtype
+        instr_shape, warps_per_tile = _mmav3_instr_and_warps(
+            num_warps, c_shape, a_dtype)
+
+        mma_layout = builder.get_mma_layout([3, 0], warps_per_tile, [],
+                                            instr_shape)
+        # acc element type from ret_ty.
+        elt_ir_ty = ret_ty.scalar.to_ir(builder)
+        mma_acc_ty = builder.get_distributed_ty(elt_ir_ty, c_shape, mma_layout)
+        # Splat zero of acc element type into mma-encoded tensor.
+        if ret_ty.scalar.is_fp32():
+            zero = builder.get_fp32(0.0)
+        elif ret_ty.scalar.is_fp16():
+            zero = builder.get_fp16(0.0)
+        elif ret_ty.scalar.is_int():
+            zero = builder.get_int32(0)
+        else:
+            raise NotImplementedError(
+                f"async_dot acc dtype {ret_ty.scalar} not handled")
+        mma_acc_handle = builder.create_splat(mma_acc_ty, zero)
+
+        if isinstance(A, tl.tensor):
+            A_handle = require_dot_operand_layout(A, 0, mma_acc_handle, builder)
+
+        # use_acc=True is correct: 0 + a*b == a*b. Lets us also accept any
+        # incoming acc value harmlessly (it's discarded).
+        output = builder.create_warpgroup_mma(A_handle, B_handle,
+                                              mma_acc_handle, None,
+                                              input_precision,
+                                              max_num_imprecise_acc, True)
+        # Strip the mma encoding via utlx_release_layout so downstream
+        # python-level ops (`.to()`, `tl.store`) — which reconstruct types
+        # from `ret_ty` (no encoding) — see consistent IR. Note: this still
+        # leaves the IR with a downstream `ttg.convert_layout(no-enc →
+        # blocked)` that the standard `tritongpu-remove-layout-conversions`
+        # pass crashes on. Fixing that requires either a wheel rebuild
+        # (proper conversion pattern for tlx.release_layout) or rewriting
+        # the python-level type system to carry encodings through `.to()`.
+        output = builder.utlx_release_layout([output])
+        return tl.tensor(output, ret_ty)
+
+    utlx_plugin.async_dot = _patched_async_dot
+    _mma_ops.async_dot = _patched_async_dot
+
+
 @register("warp_specialize_codegen")
 def _warp_specialize_codegen() -> None:
     """Rewrite uTLX's `visit_withAsyncTasks` for the new `WarpSpecializeOp`
