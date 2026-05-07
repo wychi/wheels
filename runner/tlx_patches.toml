@@ -15,8 +15,22 @@
 [default]
 patches = "all"
 
-# Current wheel — entire bridge layer needed.
+# Initial wheel — entire bridge layer needed.
 [utlx."f3d635af"]
+patches = [
+    "semantic_shims",
+    "dispatch_visit_with",
+    "make_tensor_descriptor",
+    "wgmma_use_acc_default",
+    "broadcast_shape_overload",
+    "gluon_op_builder_swap",
+    "async_load_native",
+    "wgmma_acc_layout_setup",
+    "warp_specialize_codegen",
+]
+
+# Current wheel — same patch surface as f3d635af; see ENABLEMENT.md#47debefa.
+[utlx."47debefa"]
 patches = [
     "semantic_shims",
     "dispatch_visit_with",

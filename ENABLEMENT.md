@@ -5,7 +5,8 @@ This document tracks uTLX enablement work — bugs found, fixes applied, and pat
 ## Commit Index
 
 - [`f3d635af`](#f3d635af) — Initial wheel, requires full bridge layer
-- [`1d7b7482`](#1d7b7482) — Current wheel with Triton 3.7.0+git7cff1f27
+- [`1d7b7482`](#1d7b7482) — Built but never evaluated; superseded by `47debefa`
+- [`47debefa`](#47debefa) — **Current wheel.** Same patch surface as `f3d635af`; layout-marker wall remains
 
 ---
 
@@ -181,31 +182,80 @@ All 7 patches are required for this wheel.
 
 **Wheel:** `utlx-0.1.0+git1d7b7482-cp313-cp313-linux_x86_64.whl`  
 **Triton:** 3.7.0+git7cff1f27  
-**Status:** TBD — needs testing against current patch set
+**Status:** Skipped — superseded by `47debefa` before bisect was run.
 
-### Build Info
+---
 
-Built from triton-ext commit `1d7b7482`. This is a newer wheel than `f3d635af`.
+## 47debefa
 
-### Issues & Fixes
+**Wheel:** `utlx-0.1.0+git47debefa-cp313-cp313-linux_x86_64.whl`  
+**Triton:** 3.7.0+git7cff1f27  
+**Status:** Tiny GEMM still blocked by `tlx.release_layout` lowering. Six patches required — none retired vs `f3d635af`.
 
-*To be documented as issues are discovered and fixed.*
+### Bisect against `kernels/tiny_gemm.py`
 
-### Testing Checklist
+Followed the [Patch re-evaluation playbook](#patch-re-evaluation-playbook-run-on-every-new-wheel) — start with `__tlx_patches__ = []`, add the patch addressing each successive failure until the next failure can't be bridged.
 
-- [ ] Verify wheel installs correctly
-- [ ] Run `python runner/runner.py kernels/tiny_gemm.py`
-- [ ] Run `python test_runner.py` (core tests)
-- [ ] Determine which patches from `f3d635af` are still needed
-- [ ] Update `tlx_patches.toml` with commit-specific patch list
+| Step | Patch added                  | Resulting failure                                                              |
+|------|------------------------------|--------------------------------------------------------------------------------|
+| 0    | (none)                       | `'TritonSemantic' object has no attribute '_prepare_legacy_load'`              |
+| 1    | `semantic_shims`             | `'ir.builder' object has no attribute 'create_warpgroup_mma'`                  |
+| 2    | `gluon_op_builder_swap`      | `create_broadcast`: shape-list vs `ir.type` overload mismatch                  |
+| 3    | `broadcast_shape_overload`   | `create_warpgroup_mma`: `useAcc=None` rejected                                 |
+| 4    | `wgmma_use_acc_default`      | `ttg.async_copy_global_to_local` operand count mismatch (plugin C++ bug)       |
+| 5    | `async_load_native`          | TLXConvert: `tlx.require_layout` materialization wall                          |
+| 6    | `wgmma_acc_layout_setup`     | **WALL** — `TritonGPURemoveLayoutConversions` (`tlx.release_layout` leftover)  |
+
+### Minimum required patches (this kernel)
+
+```
+semantic_shims
+gluon_op_builder_swap
+broadcast_shape_overload
+wgmma_use_acc_default
+async_load_native
+wgmma_acc_layout_setup
+```
+
+### Not exercised by `tiny_gemm.py`
+
+These patches did not appear in the bisect because the kernel doesn't use the affected APIs. They remain needed for other kernels:
+
+- `dispatch_visit_with` — required by kernels using `with tlx.async_tasks():` (e.g. `kernels/hopper_ws.py`).
+- `make_tensor_descriptor` — required by kernels using `tlx.make_tensor_descriptor` (e.g. `kernels/hopper_ws.py`).
+- `warp_specialize_codegen` — paired with `dispatch_visit_with`; same trigger.
+
+### Wheel-side delta vs `f3d635af`
+
+**Zero patches retired.** The new wheel did not address any of the six failures surfaced by this bisect — same `_prepare_legacy_load` removal, same `create_warpgroup_mma` binding gap, same `create_broadcast` overload conflict, same `useAcc` argument rejection, same `utlx_async_load` `operandSegmentSizes` bug, same `tlx.require_layout` materialization wall.
+
+### Outstanding blocker
+
+The output-side `tlx.release_layout` marker survives both convert passes and leaves a malformed `ttg.convert_layout(no-encoding → blocked)` that `TritonGPURemoveLayoutConversions` crashes on. Fixing this requires either:
+
+1. A C++ conversion pattern in `tlx-convert-triton-to-tritongpu` for `tlx.release_layout` (see [`utlx-cpp` table](#utlx-cpp--fix-in-next-wheel-rebuild-c)).
+2. Dropping the markers entirely in `mma_ops.async_dot` and emitting `ttg.convert_layout` directly with the right encoded types (see [`utlx-py` table](#utlx-py--fix-in-next-wheel-rebuild-python-only) — this would need to extend `wgmma_acc_layout_setup`'s approach to the output side, plus python-level type plumbing through `.to()`).
+
+Until either lands, `tiny_gemm.py` does not run end-to-end.
 
 ### Patch Configuration
 
 ```toml
-# Add entry here once testing is complete
-# [utlx."1d7b7482"]
-# patches = [...]
+[utlx."47debefa"]
+patches = [
+    "semantic_shims",
+    "dispatch_visit_with",
+    "make_tensor_descriptor",
+    "wgmma_use_acc_default",
+    "broadcast_shape_overload",
+    "gluon_op_builder_swap",
+    "async_load_native",
+    "wgmma_acc_layout_setup",
+    "warp_specialize_codegen",
+]
 ```
+
+> The 6 from the bisect plus the 3 not-exercised. `wgmma_acc_layout_setup` is included even though it doesn't fully unblock — without it the kernel fails one stage earlier, which is worse for diagnosis.
 
 ---
 
