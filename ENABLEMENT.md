@@ -259,6 +259,59 @@ Built from triton-ext commit `1d7b7482`. This is a newer wheel than `f3d635af`.
 
 ---
 
+## Patch Follow-ups: Where the Proper Fix Belongs
+
+Each patch in `runner/tlx_patches.py` is a Python-side bridge that papers
+over an issue with the wheel or with Triton itself. To shrink the bridge
+layer over time, classify each patch by where the *proper* fix lives:
+
+| Category    | Where                                     | Cost                                |
+|-------------|-------------------------------------------|-------------------------------------|
+| `utlx-py`   | `triton-ext/extensions/utlx/.../*.py`     | Wheel rebuild, Python-only          |
+| `utlx-cpp`  | `triton-ext/extensions/utlx/.../*.cc`     | Wheel rebuild, C++ + MLIR knowledge |
+| `triton`    | Upstream `triton-lang/triton`             | External coordination               |
+
+### `utlx-py` — fix in next wheel rebuild (Python-only)
+
+Highest leverage; smallest cost. Each retires one or more patches.
+
+| Patch                          | What to change in utlx                                           |
+|--------------------------------|------------------------------------------------------------------|
+| `gluon_op_builder_swap`        | At each call site that needs gluon-only ops (`create_warpgroup_mma`, `create_local_alloc`, `create_memdesc_index`, `create_warp_specialize`, …), construct a `GluonOpBuilder` ad-hoc instead of relying on a global swap. Eliminates the swap *and* its cascade fixups (`broadcast_shape_overload`, `make_tensor_descriptor`'s 6-arg bypass). |
+| `semantic_shims`               | Stop calling removed `TritonSemantic` methods (`_prepare_legacy_load`, `dot_precheck`); reimplement inline in `mma_ops.py` / `mem_ops.py`. |
+| `make_tensor_descriptor`       | Update `mem_ops.make_tensor_descriptor` to use the current 5-arg gluon binding; unwrap constexpr-`None` for `desc_ptr` inside. |
+| `wgmma_use_acc_default`        | `mma_ops.async_dot` should pass `_semantic.builder.get_int1(True)` for `useAcc` instead of `None`. ~5-line fix. |
+| `warp_specialize_codegen`      | Rewrite `compiler/code_generator.py:visit_withAsyncTasks` against the current `WarpSpecializeOp` IR shape (defaultRegion + partitionOpHolder + nested `WarpSpecializePartitionsOp` with `explicitCaptures`). |
+| `async_load_native` (option a) | Drop the custom `utlx_async_load` op; have `mem_ops.async_load` call `create_async_copy_global_to_local` + `create_async_commit_group` + `create_async_wait_group` directly. |
+
+### `utlx-cpp` — fix in next wheel rebuild (C++)
+
+| Patch                          | What to change in utlx                                           |
+|--------------------------------|------------------------------------------------------------------|
+| `async_load_native` (option b) | Fix the C++ side of `utlx_async_load` to set `operandSegmentSizes` correctly when constructing `ttg.async_copy_global_to_local`. Option (a) above is simpler. |
+| `wgmma_acc_layout_setup`       | The `tlx.require_layout` / `tlx.release_layout` markers need a real lowering. Either: (1) add a conversion pattern in `tlx-convert-triton-to-tritongpu` that absorbs them into surrounding `ttg.convert_layout` ops, or (2) drop the markers entirely from the `mma_ops.async_dot` codepath and emit `ttg.convert_layout` to/from the wgmma-encoded acc directly. The current Python patch is half of (2) — input side only; output side needs the same treatment plus python-level type plumbing. |
+
+### `triton` — needs upstream change (or stays as patch indefinitely)
+
+| Patch                          | What needs to land upstream                                      |
+|--------------------------------|------------------------------------------------------------------|
+| `dispatch_visit_with`          | A public extension hook for `with`-statement dispatch in `CodeGenerator.visit_With`, so plugins can register handlers without monkey-patching. Until then, the patch is the only option. |
+| `broadcast_shape_overload`     | Disappears once `gluon_op_builder_swap` is retired (no swap → no overload conflict). If the swap stays, upstream Triton would need to make `GluonOpBuilder.create_broadcast` accept either a shape list or an `ir.type`. |
+
+### Recommended sequencing for next wheel
+
+1. `utlx-py` cluster — biggest wins, smallest cost. Land in this order:
+   1. Refactor gluon-op call sites to use ad-hoc `GluonOpBuilder` (kills 3 patches).
+   2. Inline the removed-API semantics, fix `make_tensor_descriptor`, fix `wgmma_use_acc_default`.
+   3. Rewrite `visit_withAsyncTasks`.
+   4. Drop `utlx_async_load`; call gluon ops directly.
+2. `utlx-cpp` cluster — `wgmma_acc_layout_setup` is the only blocker for `tiny_gemm`; without this, the kernel still won't run end-to-end.
+3. `triton` cluster — file an upstream issue for the `visit_With` hook; otherwise live with the patch.
+
+After step 1 + 2, only `dispatch_visit_with` (and possibly `broadcast_shape_overload`) should remain on the patch side.
+
+---
+
 ## Known Test Issues
 
 These tests are excluded from the core test suite:
