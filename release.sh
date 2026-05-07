@@ -45,8 +45,45 @@ uv pip install pytest 2>&1 | tail -1
 
 if [ "$PUBLISH" = "1" ]; then
     log "Step 4/4: Publishing..."
-    publish_wheel "$TRITON_WHL" "$(release_tag_from_wheel "$TRITON_WHL")"
-    publish_wheel "$UTLX_WHL" "$(release_tag_from_wheel "$UTLX_WHL")"
+    if TRITON_URL=$(publish_wheel "$TRITON_WHL" "$(release_tag_from_wheel "$TRITON_WHL")" | xargs) && \
+       UTLX_URL=$(publish_wheel "$UTLX_WHL" "$(release_tag_from_wheel "$UTLX_WHL")" | xargs); then
+        
+        # Record release to releases.json (only if both publishes succeeded)
+        RELEASES_FILE="$SCRIPT_DIR/releases.json"
+        TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        
+        # Create JSON entry and prepend to file
+        if [ -f "$RELEASES_FILE" ]; then
+            # File exists - prepend new entry
+            TMP_FILE=$(mktemp)
+            cat > "$TMP_FILE" <<EOF
+[
+  {
+    "time": "$TIMESTAMP",
+    "utlx": "$UTLX_URL",
+    "triton": "$TRITON_URL"
+  },
+EOF
+            # Append existing entries (skip first line which is "[")
+            tail -n +2 "$RELEASES_FILE" >> "$TMP_FILE"
+            mv "$TMP_FILE" "$RELEASES_FILE"
+        else
+            # File doesn't exist - create it
+            cat > "$RELEASES_FILE" <<EOF
+[
+  {
+    "time": "$TIMESTAMP",
+    "utlx": "$UTLX_URL",
+    "triton": "$TRITON_URL"
+  }
+]
+EOF
+        fi
+        
+        log "Release recorded to $RELEASES_FILE"
+    else
+        err "Publishing failed. Release not recorded to $RELEASES_FILE."
+    fi
 else
     log "Step 4/4: Skipped (pass --publish to upload)"
     echo ""
