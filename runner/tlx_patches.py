@@ -371,11 +371,15 @@ def _dispatch_visit_with() -> None:
     cg.CodeGenerator.visit_With = _patched
 
 
-@register("make_tensor_descriptor")
+@register("make_tensor_descriptor", default=False)
 def _make_tensor_descriptor() -> None:
     """Rewrite `tlx.make_tensor_descriptor` to emit a TMA descriptor whose
     result type carries an `NVMMASharedLayout` matching the destination
     shared memory.
+
+    Retired in wheel commit `cba4ef9a`: `mem_ops.make_tensor_descriptor` now
+    emits the gluon 5-arg binding with explicit `NVMMASharedLayout` directly.
+    Kept here (not deleted) for older wheels (`f3d635af`, `47debefa`).
 
     Three problems being bridged:
 
@@ -742,10 +746,18 @@ def _async_load_native() -> None:
     _utlx_mem_ops.async_load_wait_group = _patched_wait_group
 
 
-@register("wgmma_acc_layout_setup")
+@register("wgmma_acc_layout_setup", default=False)
 def _wgmma_acc_layout_setup() -> None:
     """Replace `tlx.async_dot`'s `utlx_require_nv_mma_layout(acc)` step with a
     direct splat of zero into a tensor with the correct `#mma` encoding.
+
+    Retired in wheel commit `cba4ef9a`: `mma_ops.async_dot` now keeps the live
+    acc value via the `utlx_require_nv_mma_layout` marker (no splat-zero), and
+    a new C++ `TLXLayoutMarkerPattern` lowers the surviving
+    `tlx.{require,release}_layout` ops to `ttg.convert_layout` (or folds
+    same-encoding casts) so the `TritonGPURemoveLayoutConversions` /
+    `TritonGPUReduceDataDuplication` walls disappear. Kept here for older
+    wheels.
 
     The plugin's `tlx.require_layout` marker on the acc edge survives the
     `utlx_convert_triton_to_tritongpu` pass as an

@@ -6,7 +6,8 @@ This document tracks uTLX enablement work — bugs found, fixes applied, and pat
 
 - [`f3d635af`](#f3d635af) — Initial wheel, requires full bridge layer
 - [`1d7b7482`](#1d7b7482) — Built but never evaluated; superseded by `47debefa`
-- [`47debefa`](#47debefa) — **Current wheel.** Same patch surface as `f3d635af`; `make_tensor_descriptor` extended to embed shared-layout into descriptor type for TMA loads (`hopper_ws.py`); `tlx.release_layout` wall and acc-loop trade-off remain
+- [`47debefa`](#47debefa) — Same patch surface as `f3d635af`; `make_tensor_descriptor` extended to embed shared-layout into descriptor type for TMA loads (`hopper_ws.py`); `tlx.release_layout` wall and acc-loop trade-off remain
+- [`cba4ef9a`](#cba4ef9a) — **Current wheel.** `tlx.release_layout` wall removed (C++ `TLXLayoutMarkerPattern` lowers markers to `ttg.convert_layout`); `mma_ops.async_dot` rewritten to preserve loop-carry acc; `mem_ops.make_tensor_descriptor` emits gluon binding with NVMMASharedLayout. Two patches retired (`make_tensor_descriptor`, `wgmma_acc_layout_setup`). `kernels/hopper_ws.py` and `kernels/tiny_gemm.py` both pass end-to-end.
 
 ---
 
@@ -307,6 +308,96 @@ patch.
 
 **Status:** still blocked on the same `utlx-cpp` wall. Patch list
 unchanged; `make_tensor_descriptor` reused with extended scope.
+
+---
+
+## cba4ef9a
+
+**Wheel:** `utlx-0.1.0+gitcba4ef9a-cp313-cp313-linux_x86_64.whl`
+**Triton:** 3.7.0+git7cff1f27
+**Status:** Both `kernels/tiny_gemm.py` (single-shot) and
+`kernels/hopper_ws.py` (warp-specialized + TMA + loop-carry acc) pass
+end-to-end with `rel_err < 0.001`. Two patches retired vs `47debefa`.
+
+### Wheel-side fixes
+
+#### 1. C++ — `TLXLayoutMarkerPattern` (`utlx-cpp`)
+
+Added an `OpConversionPattern<tlx::{Require,Release}LayoutOp>` to
+`uTLXConversionPatterns.cpp:TLXConvertTritonToTritonGPU`. It runs during
+the conversion pass and lowers each marker to `ttg.convert_layout`
+between the source's encoding and the type-converter-assigned result
+encoding. When the encodings happen to match (the result was
+`tensor<...>` no-encoding and the converter assigned the same `#blocked`
+that the source already has), the pattern forwards the operand directly
+— a same-encoding no-op cast that earlier crashed
+`TritonGPUReduceDataDuplication` is now folded away.
+
+This single pattern fixes both the `tlx.release_layout` wall (output side
+of `async_dot`) and any future `tlx.require_layout` calls that survive
+typed-input bridging.
+
+#### 2. Python — `mma_ops.async_dot` Hopper path (`utlx-py`)
+
+Rewritten to preserve loop-carry acc:
+
+- Wraps the live `acc_handle` with the existing `utlx_require_nv_mma_layout`
+  marker (no splat-zero).
+- Includes `create_warpgroup_mma_wait` inline (sync semantics; matches
+  `triton.tools.triton_to_gluon_translator.hopper_helpers.tl_dot_mmav3`).
+- On the output side, emits `ttg.convert_layout(mma → blocked)` directly
+  (both encoded — valid), then `tlx.release_layout(blocked →
+  no-encoding)` so the kernel's no-encoding iter_args type matches.
+  After the conversion pass legalizes the no-encoding result to the same
+  `#blocked`, the C++ pattern folds the marker.
+
+`mma_ops.async_dot_wait` becomes a pass-through (the wait is now in
+`async_dot`).
+
+#### 3. Python — `mem_ops.make_tensor_descriptor` (`utlx-py`)
+
+Switched from the regular 6-arg `ir.builder.create_make_tensor_descriptor`
+(produces no-layout descriptor type) to the gluon 5-arg overload with an
+explicit result type built via
+`get_tensor_descriptor_layout_type(block_type, is_signed,
+NVMMASharedLayout._to_ir())`. Layout selection mirrors
+`NVMMASharedLayout.get_default_for(block_shape, dtype)` for the
+non-transposed / non-fp4 case — matches what `local_alloc` produces by
+default, so the TMA copy verifier accepts the descriptor. Also unwraps
+the JIT's `constexpr(None)` for `desc_ptr`.
+
+### Patch Configuration
+
+```toml
+[utlx."cba4ef9a"]
+patches = [
+    "semantic_shims",
+    "dispatch_visit_with",
+    "wgmma_use_acc_default",
+    "broadcast_shape_overload",
+    "gluon_op_builder_swap",
+    "async_load_native",
+    "warp_specialize_codegen",
+]
+```
+
+Two patches retired (`make_tensor_descriptor`, `wgmma_acc_layout_setup`)
+— marked `default=False` in `runner/tlx_patches.py` with `Retire when:`
+notes pointing at this commit. The remaining 7 are still load-bearing.
+
+### Patch obsoletion summary
+
+| Patch                        | Status in `cba4ef9a` | Why                                                                 |
+|------------------------------|----------------------|---------------------------------------------------------------------|
+| `make_tensor_descriptor`     | Retired              | `mem_ops.make_tensor_descriptor` now embeds NVMMASharedLayout.      |
+| `wgmma_acc_layout_setup`     | Retired              | `mma_ops.async_dot` preserves loop-carry; C++ pattern lowers markers. |
+| `semantic_shims`             | Still required       | uTLX still calls removed `_prepare_legacy_load`/`dot_precheck`/`_unwrap_if_constexpr`. |
+| `dispatch_visit_with`        | Still required       | Upstream still has no `visit_With` extension hook.                  |
+| `wgmma_use_acc_default`      | Still required       | Other Hopper paths (`async_dot_scaled`, …) still pass `use_acc=None`. |
+| `broadcast_shape_overload`   | Still required       | Coexists with `gluon_op_builder_swap`.                              |
+| `gluon_op_builder_swap`      | Still required       | uTLX call sites still use `_semantic.builder` for gluon-only ops.   |
+| `async_load_native`          | Still required       | Plugin's `utlx_async_load` op still has the `operandSegmentSizes` bug. |
+| `warp_specialize_codegen`    | Still required       | `visit_withAsyncTasks` still uses the stale `WarpSpecializeOp` shape. |
 
 ---
 

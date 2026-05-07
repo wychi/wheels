@@ -29,7 +29,7 @@ patches = [
     "warp_specialize_codegen",
 ]
 
-# Current wheel — same patch surface as f3d635af; see ENABLEMENT.md#47debefa.
+# Previous wheel — same patch surface as f3d635af; see ENABLEMENT.md#47debefa.
 [utlx."47debefa"]
 patches = [
     "semantic_shims",
@@ -40,5 +40,23 @@ patches = [
     "gluon_op_builder_swap",
     "async_load_native",
     "wgmma_acc_layout_setup",
+    "warp_specialize_codegen",
+]
+
+# Current wheel — async_dot, make_tensor_descriptor, and tlx layout markers
+# are now fixed in-wheel (see ENABLEMENT.md#cba4ef9a). Drops:
+#   - `make_tensor_descriptor`     (wheel emits gluon binding with NVMMA layout)
+#   - `wgmma_acc_layout_setup`     (wheel async_dot preserves loop-carry acc and
+#                                   includes wait + convert_layout inline; the
+#                                   C++ TLXLayoutMarkerPattern lowers the
+#                                   surviving release_layout marker)
+[utlx."cba4ef9a"]
+patches = [
+    "semantic_shims",
+    "dispatch_visit_with",
+    "wgmma_use_acc_default",
+    "broadcast_shape_overload",
+    "gluon_op_builder_swap",
+    "async_load_native",
     "warp_specialize_codegen",
 ]
