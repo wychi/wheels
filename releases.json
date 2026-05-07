@@ -1,2 +1,7 @@
 [
+  {
+    "time": "2026-05-07T19:59:42Z",
+    "utlx": "https://github.com/wychi/wheels/releases/download/utlx-0.1.0-47debefa/utlx-0.1.0+git47debefa-cp313-cp313-linux_x86_64.whl",
+    "triton": "https://github.com/wychi/wheels/releases/download/triton-3.7.0-7cff1f27/triton-3.7.0+git7cff1f27-cp313-cp313-linux_x86_64.whl"
+  }
 ]
