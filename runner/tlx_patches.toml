@@ -1,0 +1,29 @@
+# Per-wheel selection of monkey patches from kernels/tlx_patches.py.
+#
+# Lookup: keyed by the utlx wheel commit (the local segment of the installed
+# version, e.g. `pip show utlx | awk '/^Version/ {print $2}'` →
+# `0.1.0+gitf3d635af` → `f3d635af`).
+#
+# Resolution order (see tlx_patches.resolve_for_kernel):
+#   1. Kernel module declares `__tlx_patches__ = [...]` at top-level.
+#   2. This file: section matching the utlx commit.
+#   3. Section [default] below.
+#
+# A list of names selects exactly those. The string "all" expands to every
+# patch registered with default=True in tlx_patches.py.
+
+[default]
+patches = "all"
+
+# Current wheel — entire bridge layer needed.
+[utlx."f3d635af"]
+patches = [
+    "semantic_shims",
+    "dispatch_visit_with",
+    "make_tensor_descriptor",
+    "wgmma_use_acc_default",
+    "broadcast_shape_overload",
+    "gluon_op_builder_swap",
+    "async_load_native",
+    "warp_specialize_codegen",
+]
