@@ -158,12 +158,14 @@ read_triton_version() {
 publish_wheel() {
     local whl="$1" tag="$2" name
     name="$(basename "$whl")"
-    if gh release view "$tag" --repo "$REPO" &>/dev/null; then
-        gh release upload "$tag" "$whl" --repo "$REPO" --clobber
+    # Route gh's stdout to stderr so the only thing on this function's stdout
+    # is the download URL — callers capture that with $(...).
+    if gh release view "$tag" --repo "$REPO" >&2 2>/dev/null; then
+        gh release upload "$tag" "$whl" --repo "$REPO" --clobber >&2
     else
-        gh release create "$tag" "$whl" --repo "$REPO" --title "$tag" --notes "Wheel: $name"
+        gh release create "$tag" "$whl" --repo "$REPO" --title "$tag" --notes "Wheel: $name" >&2
     fi
-    echo "  https://github.com/$REPO/releases/download/$tag/$name"
+    echo "https://github.com/$REPO/releases/download/$tag/$name"
 }
 
 # ── release_tag_from_wheel ──────────────────────────────────────────────────

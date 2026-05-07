@@ -15,6 +15,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 source "$SCRIPT_DIR/env.sh"
 
+# Fail fast on missing publish credentials — the build takes ~30 min.
+if [ "$PUBLISH" = "1" ] && [ -z "${GH_TOKEN:-}" ]; then
+    err "GH_TOKEN is not set; required for --publish. Export it or run 'gh auth login' and unset --publish."
+fi
+
 # ── resolve deps ─────────────────────────────────────────────────────────────
 
 resolve_deps "$TRITON_EXT_COMMIT"
@@ -45,8 +50,8 @@ uv pip install pytest 2>&1 | tail -1
 
 if [ "$PUBLISH" = "1" ]; then
     log "Step 4/4: Publishing..."
-    if TRITON_URL=$(publish_wheel "$TRITON_WHL" "$(release_tag_from_wheel "$TRITON_WHL")" | xargs) && \
-       UTLX_URL=$(publish_wheel "$UTLX_WHL" "$(release_tag_from_wheel "$UTLX_WHL")" | xargs); then
+    if TRITON_URL=$(publish_wheel "$TRITON_WHL" "$(release_tag_from_wheel "$TRITON_WHL")") && \
+       UTLX_URL=$(publish_wheel "$UTLX_WHL" "$(release_tag_from_wheel "$UTLX_WHL")"); then
         
         # Record release to releases.json (only if both publishes succeeded)
         RELEASES_FILE="$SCRIPT_DIR/releases.json"
