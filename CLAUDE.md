@@ -9,7 +9,12 @@ wheels/
 ├── dist/                    # Built wheels (all versions, flat)
 ├── triton/                  # Triton build script + docs
 ├── utlx/                    # uTLX build script + docs
+├── kernels/                 # Kernel runner + example kernels
+│   ├── runner.py            # uTLX setup, patches, run kernel
+│   └── tiny_gemm.py         # Example uTLX kernel
 ├── gpumode/                 # GPUMode competition bundle
+│   ├── install_deps.py      # Wheel URLs + install function
+│   └── make_submission.py   # Generate self-contained submission
 ├── env.sh                   # Shared build helpers
 ├── release.sh               # End-to-end build + test + publish
 └── test_runner.py           # Install wheels + run utlx core tests
@@ -26,6 +31,12 @@ wheels/
 
 # Just run tests (installs latest wheels from dist/)
 python test_runner.py
+
+# Run a uTLX kernel (assumes wheels already installed)
+python kernels/runner.py kernels/tiny_gemm.py
+
+# Generate a self-contained GPUMode submission
+python gpumode/make_submission.py submission.py -o submission_tlx.py
 ```
 
 ## Dependency Chain

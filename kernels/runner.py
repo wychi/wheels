@@ -1,110 +1,47 @@
-#!/usr/bin/env bash
-# make_submission.sh — Wrap a clean submission.py into a self-contained
-# submission_tlx.py with wheel install, plugin setup, and monkey-patches.
-#
-# Usage:
-#   ./make_submission.sh submission.py              # prints to stdout
-#   ./make_submission.sh submission.py -o out.py    # writes to file
-#
-# The input submission.py should:
-#   - Follow the gpumode template (define custom_kernel(data))
-#   - Import utlx_plugin as tlx
-#   - NOT contain install/setup/monkey-patch code
-#
-# Environment:
-#   TRITON_WHEEL_URL  — override Triton wheel URL
-#   UTLX_WHEEL_URL    — override uTLX wheel URL
-
-set -euo pipefail
-
-INPUT="${1:?Usage: $0 <submission.py> [-o output.py]}"
-OUTPUT=""
-
-if [ "${2:-}" = "-o" ]; then
-    OUTPUT="${3:?-o requires a filename}"
-fi
-
-[ -f "$INPUT" ] || { echo "ERROR: $INPUT not found" >&2; exit 1; }
-
-TRITON_WHEEL_URL="${TRITON_WHEEL_URL:-https://github.com/wychi/wheels/releases/download/triton-3.7.0-be8855ac/triton-3.7.0+gitbe8855ac-cp313-cp313-linux_x86_64.whl}"
-UTLX_WHEEL_URL="${UTLX_WHEEL_URL:-https://github.com/plotfi/plotfi-wheels/raw/main/utlx-0.1.0-py3-none-any.whl}"
-
-generate() {
-cat << 'PREAMBLE_START'
 #!/usr/bin/env python3
 """
-Auto-generated submission with uTLX setup.
-Do not edit — regenerate with: ./make_submission.sh submission.py -o submission_tlx.py
+Run a uTLX kernel with plugin setup and monkey-patches.
+
+Usage:
+    python runner.py <kernel.py> [args...]
+    python runner.py tiny_gemm.py
+
+Assumes triton and utlx wheels are already installed.
 """
 
 import builtins
 import os
-import subprocess
 import sys
 import sysconfig
 from typing import Any, Optional, Tuple
 
 
-# ---------------------------------------------------------------------------
-# uTLX Setup (auto-generated)
-# ---------------------------------------------------------------------------
-
-def _install_custom_deps():
-    if "--no-install" in sys.argv:
-        return
-
-PREAMBLE_START
-
-cat << PREAMBLE_URLS
-    TRITON_WHEEL_URL = "${TRITON_WHEEL_URL}"
-    UTLX_WHEEL_URL = "${UTLX_WHEEL_URL}"
-PREAMBLE_URLS
-
-cat << 'PREAMBLE_INSTALL'
-
-    print(f"[DEBUG] Python: {sys.version}", file=sys.stderr)
-    print(f"[DEBUG] Installing triton from: {TRITON_WHEEL_URL}", file=sys.stderr)
-    result = subprocess.run([sys.executable, "-m", "pip", "install", "--force-reinstall",
-                             f"triton @ {TRITON_WHEEL_URL}",
-                             f"utlx @ {UTLX_WHEEL_URL}"],
-                            capture_output=True, text=True)
-    print(f"[DEBUG] pip exit code: {result.returncode}", file=sys.stderr)
-    print(f"[DEBUG] pip stdout: {result.stdout[-500:]}", file=sys.stderr)
-    if result.returncode != 0:
-        print(f"[DEBUG] pip stderr: {result.stderr[-500:]}", file=sys.stderr)
-        sys.exit(1)
-
-
 def _setup_utlx():
     dist_packages = sysconfig.get_paths()["purelib"]
     libutlx_path = os.path.join(dist_packages, "utlx_plugin", "libutlx.so")
-    assert os.path.isfile(libutlx_path), f"libutlx.so not found at {libutlx_path}"
+    if not os.path.isfile(libutlx_path):
+        print(f"ERROR: libutlx.so not found at {libutlx_path}", file=sys.stderr)
+        print("Install triton + utlx wheels first.", file=sys.stderr)
+        sys.exit(1)
     os.environ["TRITON_PLUGIN_PATHS"] = libutlx_path
 
-    # Reload libtriton so it picks up the plugin
-    import triton
-    print(f"[DEBUG] Triton: {triton.__version__}", file=sys.stderr)
+    if "triton" in sys.modules:
+        print("[runner] WARNING: triton imported before uTLX setup, reloading libtriton", file=sys.stderr)
+        import importlib
+        importlib.reload(sys.modules["triton"]._C.libtriton)
+    else:
+        import triton
 
-    import importlib
-    importlib.reload(triton._C.libtriton)
-    print(f"[DEBUG] uTLX loaded: {libutlx_path}", file=sys.stderr)
+    print(f"[runner] Triton {triton.__version__}", file=sys.stderr)
 
-
-_install_custom_deps()
-_setup_utlx()
-
-
-# ---------------------------------------------------------------------------
-# Monkey-patches (auto-generated)
-# ---------------------------------------------------------------------------
-
-import triton
-import triton.language as tl
-import triton.language.semantic as triton_semantic
-from triton import knobs
+    import utlx_plugin as tlx
+    print(f"[runner] uTLX loaded: {tlx.__file__}", file=sys.stderr)
 
 
 def _apply_tlx_patches():
+    import triton.language as tl
+    import triton.language.semantic as triton_semantic
+    from triton import knobs
 
     def _prepare_legacy_load(self, ptr, mask, other, boundary_check, padding):
         if not ptr.type.scalar.is_ptr():
@@ -199,74 +136,33 @@ def _apply_tlx_patches():
             max_num_imprecise_acc = self.builder.options.max_num_imprecise_acc_default if (lhs.dtype.is_fp8() and rhs.dtype.is_fp8()) else 0
         return (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc, ret_ty)
 
-    setattr(triton.language, "_unwrap_if_constexpr", _unwrap_if_constexpr)
+    setattr(tl, "_unwrap_if_constexpr", _unwrap_if_constexpr)
     setattr(triton_semantic.TritonSemantic, "_prepare_legacy_load", _prepare_legacy_load)
     setattr(triton_semantic.TritonSemantic, "dot_precheck", dot_precheck)
 
 
-_apply_tlx_patches()
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <kernel.py> [args...]", file=sys.stderr)
+        sys.exit(1)
 
-PREAMBLE_INSTALL
+    kernel_file = sys.argv[1]
+    if not os.path.isfile(kernel_file):
+        kernel_dir = os.path.dirname(os.path.abspath(__file__))
+        candidate = os.path.join(kernel_dir, kernel_file)
+        if os.path.isfile(candidate):
+            kernel_file = candidate
+        else:
+            print(f"ERROR: {kernel_file} not found", file=sys.stderr)
+            sys.exit(1)
 
-# Strip imports that the preamble already provides, then emit the user's kernel code.
-# We keep all lines except redundant imports and the original shebang/docstring header.
-python3 -c "
-import sys
+    _setup_utlx()
+    _apply_tlx_patches()
 
-skip_imports = {
-    'import builtins',
-    'import os',
-    'import subprocess',
-    'import sys',
-    'import sysconfig',
-    'from typing import',
-    'import triton',
-    'import triton.language as tl',
-    'import triton.language.semantic',
-    'from triton import knobs',
-}
+    import runpy
+    sys.argv = sys.argv[1:]
+    runpy.run_path(kernel_file, run_name="__main__")
 
-lines = open(sys.argv[1]).readlines()
-in_docstring = False
-skipped_header = False
 
-print()
-print('# ---------------------------------------------------------------------------')
-print('# Kernel (from ${INPUT})')
-print('# ---------------------------------------------------------------------------')
-print()
-
-for line in lines:
-    stripped = line.rstrip()
-
-    # Skip shebang
-    if stripped.startswith('#!') and not skipped_header:
-        skipped_header = True
-        continue
-
-    # Skip module docstring
-    if stripped.startswith('\"\"\"') and not in_docstring:
-        in_docstring = True
-        if stripped.count('\"\"\"') >= 2:
-            in_docstring = False
-        continue
-    if in_docstring:
-        if '\"\"\"' in stripped:
-            in_docstring = False
-        continue
-
-    # Skip redundant imports
-    if any(stripped.startswith(s) for s in skip_imports):
-        continue
-
-    print(line, end='')
-" "$INPUT"
-}
-
-if [ -n "$OUTPUT" ]; then
-    generate > "$OUTPUT"
-    chmod +x "$OUTPUT"
-    echo "Generated: $OUTPUT" >&2
-else
-    generate
-fi
+if __name__ == "__main__":
+    main()
