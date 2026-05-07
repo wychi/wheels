@@ -298,6 +298,53 @@ Highest leverage; smallest cost. Each retires one or more patches.
 | `dispatch_visit_with`          | A public extension hook for `with`-statement dispatch in `CodeGenerator.visit_With`, so plugins can register handlers without monkey-patching. Until then, the patch is the only option. |
 | `broadcast_shape_overload`     | Disappears once `gluon_op_builder_swap` is retired (no swap → no overload conflict). If the swap stays, upstream Triton would need to make `GluonOpBuilder.create_broadcast` accept either a shape list or an `ir.type`. |
 
+### Key files
+
+Pointers for the next session — where to look when implementing each fix.
+Paths under `~/.venv/lib/python*/site-packages/utlx_plugin/` are inside the
+*installed wheel*; the source-of-truth lives at the same relative path under
+`triton-ext/extensions/utlx/python/utlx_plugin/`.
+
+**uTLX Python source (rebuild target for `utlx-py` cluster):**
+
+| Subsystem                  | Files                                                                  | Patches it would retire                          |
+|----------------------------|------------------------------------------------------------------------|--------------------------------------------------|
+| MMA ops (`async_dot`)      | `utlx_plugin/mma_ops.py` — `async_dot`, `require_nv_mma_shared_layout`, `require_dot_operand_layout` | `wgmma_use_acc_default`, `gluon_op_builder_swap` (mma side), `semantic_shims` (`dot_precheck`) |
+| Memory ops (`async_load`)  | `utlx_plugin/mem_ops.py` — `async_load`, `async_load_commit_group`, `async_load_wait_group`, `make_tensor_descriptor` | `async_load_native`, `make_tensor_descriptor`, `semantic_shims` (`_prepare_legacy_load`) |
+| Code generator             | `utlx_plugin/compiler/code_generator.py` — `visit_withAsyncTasks`      | `warp_specialize_codegen`                        |
+| Dispatch table             | `utlx_plugin/compiler/dispatch.py` — `TLX_WITH_DISPATCH`               | (consumed by `dispatch_visit_with`)              |
+| Pipeline / custom stages   | `utlx_plugin/custom_stages.py` — `make_ttir_wrapper`, `make_llir_wrapper` | (where new ttg attrs / passes hook in)        |
+
+**uTLX C++ source (rebuild target for `utlx-cpp` cluster):**
+
+| Subsystem                              | Files                                                                       | Patches it would retire           |
+|----------------------------------------|-----------------------------------------------------------------------------|-----------------------------------|
+| pybind init (`triton_tlx`)             | `triton-ext/extensions/utlx/tlx/dialect/triton_tlx.cc`                      | (currently dead — see below)      |
+| `tlx.require_layout` / `tlx.release_layout` lowering | `triton-ext/extensions/utlx/.../TLXConvertTritonToTritonGPU.cpp` | `wgmma_acc_layout_setup`          |
+| `utlx_async_load` op                   | `triton-ext/extensions/utlx/.../UtlxAsyncLoadOp.cpp` (or wherever the op constructor sets `operandSegmentSizes`) | `async_load_native` (option b) |
+
+> Note: `libutlx.so` ships only `tritonGetPluginInfo`; the `init_triton_tlx_ir`
+> pybind extensions in `triton_tlx.cc` are never loaded at runtime. If the
+> rebuild plan involves new pybind bindings, that load path needs fixing too.
+
+**Reference implementations in upstream Triton (model after these):**
+
+| Topic                          | File                                                                                                          | Use for                                              |
+|--------------------------------|---------------------------------------------------------------------------------------------------------------|------------------------------------------------------|
+| Hopper wgmma layout selection  | `triton/tools/triton_to_gluon_translator/hopper_helpers.py:_mmav3_acc_layout`                                 | `wgmma_acc_layout_setup` rewrite                     |
+| Default blocked layout         | `triton/tools/triton_to_gluon_translator/common_helpers.py:default_blocked_layout`                            | Anywhere we need a fallback distributed layout       |
+| Gluon `warp_specialize` codegen| `triton/experimental/gluon/language/_semantic.py:warp_specialize`                                             | `warp_specialize_codegen` rewrite (already mirrored) |
+| Gluon module attrs setup       | `triton/experimental/gluon/_runtime.py:GluonASTSource.make_ir` (`ttg.target` / `ttg.num-warps` / etc.)        | Already mirrored in `gluon_op_builder_swap`          |
+| Native `async_load`            | `triton/experimental/gluon/language/nvidia/ampere/async_copy.py:async_load`                                   | `async_load_native` (already mirrored)               |
+| Native `warpgroup_mma`         | `triton/experimental/gluon/language/nvidia/hopper/__init__.py:warpgroup_mma`                                  | Reference for the proper acc-layout protocol         |
+| `tl.dot` translation           | `triton/tools/triton_to_gluon_translator/hopper_helpers.py:tl_dot_mmav3`                                      | End-to-end pattern for gluon-style dot               |
+
+**Patch registry (this repo):**
+
+- `runner/tlx_patches.py` — all patches with rationale and `Retire when:` notes.
+- `runner/tlx_patches.toml` — per-wheel-commit patch selection.
+- `runner/CLAUDE.md` — patch catalog, selection rules, diagnostic recipes.
+
 ### Recommended sequencing for next wheel
 
 1. `utlx-py` cluster — biggest wins, smallest cost. Land in this order:
