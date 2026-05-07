@@ -10,7 +10,7 @@ Usage:
     python make_submission.py submission.py -o out.py    # writes to file
 
 Wheel URL resolution order:
-    1. releases.json [0] (latest entry — release.sh --publish prepends)
+    1. releases.json [0] (latest entry — gh_release.sh prepends)
     2. DEFAULT_TRITON_URL / DEFAULT_UTLX_URL (last-known-good)
 """
 

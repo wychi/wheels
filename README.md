@@ -17,10 +17,10 @@ Start from a triton-ext commit — the build scripts resolve the full dependency
 
 ```bash
 # Build + test both wheels
-./release.sh <triton-ext-commit>
+./build_wheels.sh <triton-ext-commit>
 
-# Build + test + publish to GitHub Releases
-./release.sh <triton-ext-commit> --publish
+# Publish the resulting dist/*.whl to GitHub Releases
+./gh_release.sh
 ```
 
 Or build individually:

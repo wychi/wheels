@@ -407,7 +407,7 @@ notes pointing at this commit. The remaining 7 are still load-bearing.
 
 1. **Build the wheel:**
    ```bash
-   ./release.sh <triton-ext-commit>
+   ./build_wheels.sh <triton-ext-commit>
    ```
 
 2. **Re-evaluate the patch list** — see the [Patch re-evaluation

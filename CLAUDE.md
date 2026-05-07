@@ -19,7 +19,8 @@ wheels/
 │   ├── install_deps.py      # Wheel URLs + install function
 │   └── make_submission.py   # Generate self-contained submission
 ├── env.sh                   # Shared build helpers
-├── release.sh               # End-to-end build + test + publish
+├── build_wheels.sh          # Build + test wheels (Triton + uTLX)
+├── gh_release.sh            # Publish built wheels to GitHub Releases
 └── test_runner.py           # Install wheels + run utlx core tests
 ```
 
@@ -27,10 +28,10 @@ wheels/
 
 ```bash
 # Build + test everything from a triton-ext commit
-./release.sh <triton-ext-commit>
+./build_wheels.sh <triton-ext-commit>
 
-# Build + test + publish to GitHub Releases
-./release.sh <triton-ext-commit> --publish
+# Publish the resulting dist/*.whl to GitHub Releases
+./gh_release.sh
 
 # Just run tests (installs latest wheels from dist/)
 python test_runner.py
@@ -93,10 +94,11 @@ Build bottom-up (each step needs the one below it):
 
 ## Build Scripts
 
-- **`release.sh <triton-ext-commit>`** — full pipeline: resolves deps, builds everything, runs tests, optionally publishes
+- **`build_wheels.sh <triton-ext-commit>`** — full build pipeline: resolves deps, builds everything, runs tests
+- **`gh_release.sh`** — publishes built wheels in `dist/` to GitHub Releases and records URLs in `releases.json`
 - **`triton/build_triton_wheel.sh <triton-commit>`** — builds Triton wheel (handles LLVM automatically)
 - **`utlx/build_utlx_wheel.sh <triton-ext-commit>`** — builds uTLX wheel (requires Triton already built)
-- **`env.sh`** — shared helpers: `resolve_deps`, `setup_triton_env`, `setup_venv`, `setup_llvm_tools`, etc.
+- **`env.sh`** — shared helpers: `resolve_deps`, `setup_triton_env`, `setup_venv`, `setup_llvm_tools`, `publish_wheel`, etc.
 
 ## Build Dependencies
 
