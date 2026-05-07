@@ -373,27 +373,64 @@ def _dispatch_visit_with() -> None:
 
 @register("make_tensor_descriptor")
 def _make_tensor_descriptor() -> None:
-    """Rewrite `tlx.make_tensor_descriptor` for two reasons:
+    """Rewrite `tlx.make_tensor_descriptor` to emit a TMA descriptor whose
+    result type carries an `NVMMASharedLayout` matching the destination
+    shared memory.
+
+    Three problems being bridged:
 
     1. The JIT wraps a literal `None` arg into `constexpr(None)`; the
        original `is None` type check rejects that.
-    2. With the GluonOpBuilder swap active, pybind11 picks gluon's 5-arg
-       `create_make_tensor_descriptor` (explicit result type) over the
-       regular 6-arg form (block_shape + is_signed) that uTLX invokes. We
-       call the regular `ir.builder.create_make_tensor_descriptor` unbound
-       method explicitly to bypass gluon's override.
+    2. uTLX's `mem_ops.make_tensor_descriptor` calls the regular 6-arg
+       `ir.builder.create_make_tensor_descriptor` (block_shape + is_signed),
+       which produces a `!tt.tensordesc<…>` with NO encoded layout
+       attribute. Current Triton's `ttng.async_tma_copy_global_to_local`
+       verifier rejects that with "TMA descriptor layout must match shared
+       layout, but got descriptor layout <<NULL ATTRIBUTE>>".
+    3. Gluon's 5-arg overload takes an explicit result type, so we build
+       the tensordesc type with `get_tensor_descriptor_layout_type(
+       block_type, is_signed, NVMMASharedLayout._to_ir())` and call gluon's
+       binding directly. Layout selection mirrors
+       `triton.experimental.gluon.language._layouts.NVMMASharedLayout
+       .get_default_for(block_shape, dtype)` for the
+       transposed=False / fp4_padded=False / no-CGA case, which is what
+       `local_alloc` produces by default — keeping desc and dest layouts
+       in sync.
 
     Retire when: uTLX's `make_tensor_descriptor` is updated for the new
     Triton signature, AND the JIT's constexpr wrapping is handled inside.
+
+    Must run after `gluon_op_builder_swap` (relies on `_semantic.builder`
+    being a `GluonOpBuilder` for `get_nvmma_shared_layout` /
+    `get_tensor_descriptor_layout_type`).
     """
     import functools
 
     import triton.language.core as tl_core
     import utlx_plugin
     import utlx_plugin.mem_ops as _utlx_mem_ops
-    from triton._C.libtriton import ir as _ir
+    from triton._C.libtriton import gluon_ir as _gluon_ir
 
-    _builder_mtd_regular = _ir.builder.create_make_tensor_descriptor
+    _gluon_create_mtd = _gluon_ir.GluonOpBuilder.create_make_tensor_descriptor
+
+    def _default_nvmma_swizzle(block_shape, element_bitwidth):
+        """Mirror NVMMASharedLayout.get_default_for swizzle selection
+        (transposed=False, fp4_padded=False, no CGA)."""
+        contig_bytes = block_shape[-1] * element_bitwidth // 8
+        if contig_bytes >= 128 and contig_bytes % 128 == 0:
+            swizzle = 128
+        elif contig_bytes >= 64 and contig_bytes % 64 == 0:
+            swizzle = 64
+        elif contig_bytes >= 32 and contig_bytes % 32 == 0:
+            swizzle = 32
+        else:
+            swizzle = 0
+        flatten_outer = 1
+        for s in block_shape[:-1]:
+            flatten_outer *= s
+        if len(block_shape) < 2 or flatten_outer < 8:
+            swizzle = 0
+        return swizzle
 
     @tl_core.builtin
     @functools.wraps(utlx_plugin.make_tensor_descriptor)
@@ -425,10 +462,20 @@ def _make_tensor_descriptor() -> None:
         block_type = tl_core.block_type(base.type.element_ty, block_shape)
         is_signed_int = base.type.element_ty.is_int_signed()
         padding = _semantic._str_to_padding_option(padding_option)
-        handle = _builder_mtd_regular(
-            _semantic.builder, base.handle, [s.handle for s in shape_vals],
-            [s.handle for s in strides_vals], block_shape, is_signed_int,
-            padding)
+
+        builder = _semantic.builder
+        elt_ty = base.type.element_ty
+        element_bitwidth = elt_ty.primitive_bitwidth
+        rank = len(block_shape)
+        swizzle = _default_nvmma_swizzle(block_shape, element_bitwidth)
+        layout_attr = builder.get_nvmma_shared_layout(swizzle,
+                                                     element_bitwidth,
+                                                     False, False, [], rank)
+        result_ty = builder.get_tensor_descriptor_layout_type(
+            block_type.to_ir(builder), is_signed_int, layout_attr)
+        handle = _gluon_create_mtd(builder, result_ty, base.handle,
+                                   [s.handle for s in shape_vals],
+                                   [s.handle for s in strides_vals], padding)
         return tl_core.tensor_descriptor(handle, shape_vals, strides_vals,
                                          block_type)
 

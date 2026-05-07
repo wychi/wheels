@@ -6,7 +6,7 @@ This document tracks uTLX enablement work — bugs found, fixes applied, and pat
 
 - [`f3d635af`](#f3d635af) — Initial wheel, requires full bridge layer
 - [`1d7b7482`](#1d7b7482) — Built but never evaluated; superseded by `47debefa`
-- [`47debefa`](#47debefa) — **Current wheel.** Same patch surface as `f3d635af`; layout-marker wall remains
+- [`47debefa`](#47debefa) — **Current wheel.** Same patch surface as `f3d635af`; `make_tensor_descriptor` extended to embed shared-layout into descriptor type for TMA loads (`hopper_ws.py`); `tlx.release_layout` wall and acc-loop trade-off remain
 
 ---
 
@@ -256,6 +256,58 @@ patches = [
 
 > The 6 from the bisect plus the 3 not-exercised. `wgmma_acc_layout_setup` is included even though it doesn't fully unblock — without it the kernel fails one stage earlier, which is worse for diagnosis.
 
+### Follow-up: `kernels/hopper_ws.py` enablement (2026-05-07)
+
+Exercising the warp-specialized + TMA kernel surfaced one new patch-side
+issue and confirmed the same wall as `tiny_gemm.py`.
+
+**New finding — TMA descriptor missing layout encoding:**
+
+With the previous `make_tensor_descriptor` patch (which routed to the
+regular 6-arg `ir.builder.create_make_tensor_descriptor`), the result
+type was `!tt.tensordesc<BMxBKxf16>` with no encoded layout. Current
+Triton's `ttng.async_tma_copy_global_to_local` verifier rejects this:
+
+```
+'ttng.async_tma_copy_global_to_local' op TMA descriptor layout must
+match shared layout, but got descriptor layout <<NULL ATTRIBUTE>> and
+shared memory layout #ttg.nvmma_shared<{swizzlingByteWidth = 128,
+transposed = false, elementBitWidth = 16}>
+```
+
+Updated `make_tensor_descriptor` patch now calls gluon's 5-arg overload
+with an explicit result type built via
+`get_tensor_descriptor_layout_type(block_type, is_signed,
+NVMMASharedLayout._to_ir())`. Layout selection mirrors
+`NVMMASharedLayout.get_default_for(block_shape, dtype)` for the
+non-transposed / non-fp4 case — the same algorithm `local_alloc` uses by
+default, so descriptor and destination layouts agree.
+
+Same patch slot, same wheel-side classification (`utlx-py`); the docstring
+in `runner/tlx_patches.py` and the catalog row in `runner/CLAUDE.md` have
+been extended with the new symptom.
+
+**Same wall as tiny_gemm + acc-loop trade-off:**
+
+After the descriptor fix, the kernel reaches the documented
+[outstanding blocker](#outstanding-blocker): `tlx.release_layout` on the
+acc edge produces a `tensor<...xf32>` (no encoding), which feeds a
+`ttg.convert_layout(no-encoding → blocked)` that the downstream pipeline
+crashes on (`TritonGPUReduceDataDuplication` here vs.
+`TritonGPURemoveLayoutConversions` for `tiny_gemm` — both downstream of
+the same malformed cast). No new bridge attempted.
+
+The IR also exposes the documented "single-shot acc only" trade-off in
+`wgmma_acc_layout_setup`: `ttng.warp_group_dot` is fed a
+`%cst (= dense<0.000000e+00>)` instead of the loop carry-in, so even past
+the lowering wall the kernel would silently compute `a*b` for the last
+iteration only. Loop accumulators in `hopper_ws.py` need either a wheel
+rebuild (Python-level fix in `mma_ops.async_dot`) or a more sophisticated
+patch.
+
+**Status:** still blocked on the same `utlx-cpp` wall. Patch list
+unchanged; `make_tensor_descriptor` reused with extended scope.
+
 ---
 
 ## Enablement Workflow
@@ -326,7 +378,7 @@ Highest leverage; smallest cost. Each retires one or more patches.
 |--------------------------------|------------------------------------------------------------------|
 | `gluon_op_builder_swap`        | At each call site that needs gluon-only ops (`create_warpgroup_mma`, `create_local_alloc`, `create_memdesc_index`, `create_warp_specialize`, …), construct a `GluonOpBuilder` ad-hoc instead of relying on a global swap. Eliminates the swap *and* its cascade fixups (`broadcast_shape_overload`, `make_tensor_descriptor`'s 6-arg bypass). |
 | `semantic_shims`               | Stop calling removed `TritonSemantic` methods (`_prepare_legacy_load`, `dot_precheck`); reimplement inline in `mma_ops.py` / `mem_ops.py`. |
-| `make_tensor_descriptor`       | Update `mem_ops.make_tensor_descriptor` to use the current 5-arg gluon binding; unwrap constexpr-`None` for `desc_ptr` inside. |
+| `make_tensor_descriptor`       | Update `mem_ops.make_tensor_descriptor` to use the current 5-arg gluon binding (`get_tensor_descriptor_layout_type(block_type, is_signed, NVMMASharedLayout._to_ir())`) so the result tensordesc carries an embedded shared-memory layout that matches the destination `local_alloc`. Without it, `ttng.async_tma_copy_global_to_local`'s verifier fires "TMA descriptor layout must match shared layout, but got descriptor layout <<NULL ATTRIBUTE>>". Also unwrap constexpr-`None` for `desc_ptr` inside. |
 | `wgmma_use_acc_default`        | `mma_ops.async_dot` should pass `_semantic.builder.get_int1(True)` for `useAcc` instead of `None`. ~5-line fix. |
 | `warp_specialize_codegen`      | Rewrite `compiler/code_generator.py:visit_withAsyncTasks` against the current `WarpSpecializeOp` IR shape (defaultRegion + partitionOpHolder + nested `WarpSpecializePartitionsOp` with `explicitCaptures`). |
 | `async_load_native` (option a) | Drop the custom `utlx_async_load` op; have `mem_ops.async_load` call `create_async_copy_global_to_local` + `create_async_commit_group` + `create_async_wait_group` directly. |
