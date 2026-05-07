@@ -18,7 +18,9 @@ import re
 import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-RUNNER_PATH = os.path.join(SCRIPT_DIR, "..", "kernels", "runner.py")
+RUNNER_DIR = os.path.join(SCRIPT_DIR, "..", "runner")
+RUNNER_PATH = os.path.join(RUNNER_DIR, "runner.py")
+PATCHES_PATH = os.path.join(RUNNER_DIR, "tlx_patches.py")
 INSTALL_PATH = os.path.join(SCRIPT_DIR, "install_deps.py")
 
 
@@ -56,11 +58,29 @@ def strip_main(source):
     )
 
 
+def _resolve_patches(input_path):
+    """Resolve patch list at generation time. Tries the kernel's
+    `__tlx_patches__` decl first, otherwise applies all defaults — the
+    runtime container installs a wheel whose commit may not match the
+    [utlx.\"<commit>\"] entries in tlx_patches.toml, so don't rely on
+    runtime TOML lookup.
+    """
+    sys.path.insert(0, RUNNER_DIR)
+    try:
+        import tlx_patches
+    finally:
+        sys.path.pop(0)
+    decl = tlx_patches._read_kernel_decl(input_path)
+    return decl if decl is not None else tlx_patches._all_default_names()
+
+
 def generate(input_path):
     install = strip_header(read_source(INSTALL_PATH)).rstrip("\n")
     runner = strip_main(strip_header(read_source(RUNNER_PATH))).rstrip("\n")
+    patches_module = strip_header(read_source(PATCHES_PATH)).rstrip("\n")
     kernel = read_source(input_path).rstrip("\n")
     name = os.path.basename(input_path)
+    selected = _resolve_patches(input_path)
 
     return f"""\
 #!/usr/bin/env python3
@@ -73,14 +93,19 @@ Do not edit — regenerate with: make_submission.py {name}
 {install}
 
 
-# --- uTLX setup + patches (from runner.py) ---
+# --- uTLX setup (from runner.py) ---
 
 {runner}
 
 
+# --- Patch registry (from tlx_patches.py) ---
+
+{patches_module}
+
+
 _install_custom_deps()
 _setup_utlx()
-_apply_tlx_patches()
+apply({selected!r})
 
 
 # --- Kernel (from {name}) ---
@@ -95,7 +120,7 @@ def main():
     parser.add_argument("-o", "--output", help="Output file (default: stdout)")
     args = parser.parse_args()
 
-    for path, label in [(args.input, "input"), (RUNNER_PATH, "runner.py"), (INSTALL_PATH, "install_deps.py")]:
+    for path, label in [(args.input, "input"), (RUNNER_PATH, "runner.py"), (PATCHES_PATH, "tlx_patches.py"), (INSTALL_PATH, "install_deps.py")]:
         if not os.path.isfile(path):
             print(f"ERROR: {label} not found at {path}", file=sys.stderr)
             sys.exit(1)
