@@ -96,23 +96,26 @@ setup_triton_env() {
 }
 
 # ── setup_venv ───────────────────────────────────────────────────────────────
-# Activates (or creates) a Python venv. Sets PYTHON.
+# Activates (or creates) the wheels project venv at <wheels>/.venv. Sets
+# PYTHON and VENV_DIR. Build and test share this single venv.
+
+WHEELS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 setup_venv() {
-    local py_short
-    py_short=$(echo "$PYTHON_VERSION" | tr -d '.')
-    VENV_DIR="$TRITON_REPO/.venv${py_short}"
+    VENV_DIR="$WHEELS_DIR/.venv"
 
     if [ -n "${PYTHON:-}" ]; then
         log "Using provided PYTHON=$PYTHON"
-    elif [ -f "$VENV_DIR/bin/python" ]; then
-        PYTHON="$VENV_DIR/bin/python"
     else
-        log "Creating Python $PYTHON_VERSION venv..."
-        uv python install "$PYTHON_VERSION"
-        uv venv --python "$PYTHON_VERSION" "$VENV_DIR"
+        if [ ! -f "$VENV_DIR/bin/python" ]; then
+            log "Creating Python $PYTHON_VERSION venv at $VENV_DIR..."
+            uv python install "$PYTHON_VERSION"
+            uv venv --python "$PYTHON_VERSION" "$VENV_DIR"
+        fi
         PYTHON="$VENV_DIR/bin/python"
-        uv pip install --python "$PYTHON" build 'cmake>=3.20,<4.0' ninja setuptools wheel pybind11
+        # Idempotent: ensures build deps are present even if venv pre-existed.
+        uv pip install --python "$PYTHON" --quiet \
+            build 'cmake>=3.20,<4.0' ninja setuptools wheel pybind11
     fi
 
     source "$VENV_DIR/bin/activate"
