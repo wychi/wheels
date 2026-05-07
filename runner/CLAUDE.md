@@ -73,36 +73,34 @@ loaded** — those defs (e.g. the 7-arg `create_make_tensor_descriptor` with
 `desc_ptr`, `create_warp_specialize_op`) are dead code at runtime. If you hit
 `'ir.builder' object has no attribute 'create_X'`, that's almost always why.
 
-## Bridge categories
+## Patch catalog
 
-1. **Semantic-method shims** — restore methods that were on `TritonSemantic`
-   in the older Triton (e.g. `_prepare_legacy_load`, `dot_precheck`).
-2. **`visit_With` dispatch** — current Triton's `CodeGenerator.visit_With` has
-   no extension hook, so uTLX's `TLX_WITH_DISPATCH` table is never consulted.
-   We patch `visit_With` to consult it before the default flow, which routes
-   `with tlx.async_tasks(): / with tlx.async_task(...):` to the uTLX codegen.
-3. **TLX builtin signature shims** — JIT wraps `None` literals into
-   `constexpr(None)`; type checks that compare `is None` need an unwrap.
-4. **GluonOpBuilder swap** — most TLX-relevant ops (`create_warpgroup_mma`,
-   `create_async_tma_copy_*`, `create_local_alloc`, `create_memdesc_index`,
-   `create_warp_specialize`, …) are bound only on `gluon_ir.GluonOpBuilder`.
-   Since `GluonOpBuilder` is a subclass of `ir.builder`, swap it in after
-   `CodeGenerator.__init__` while keeping `TritonSemantic`. Where pybind
-   method resolution then picks the wrong overload (e.g. gluon's 5-arg
-   `create_make_tensor_descriptor` vs. the regular 6-arg form), call the
-   regular `ir.builder.create_X` unbound method explicitly to bypass.
-5. **`create_warpgroup_mma` `useAcc` default** — uTLX passes `None`; the
-   binding now requires an `ir.value`. Wrap the method to default to
-   `get_int1(True)`.
-6. **WarpSpecializeOp codegen rewrite** — the legacy uTLX
-   `visit_withAsyncTasks` targets a stale IR shape (flat partition regions on
-   the WS op + `append_operand` for captures). Current Triton's
-   `WarpSpecializeOp` has only `defaultRegion` + `partitionOpHolder`; the N
-   partition regions live inside a nested `WarpSpecializePartitionsOp` whose
-   `explicitCaptures` operand carries the captures. Reimplement the codegen
-   along the lines of `triton/python/triton/experimental/gluon/language/_semantic.py`
-   `warp_specialize`, using a `GluonOpBuilder` that shares the `MLIRContext`
-   for the WS structural ops.
+Each registered patch fixes a specific failure mode. Full rationale and
+`Retire when:` notes live in each patch's docstring in `tlx_patches.py`.
+For the proper-fix-location classification (`utlx-py` / `utlx-cpp` / `triton`)
+and key files to touch in a wheel rebuild, see [`ENABLEMENT.md` →
+"Patch Follow-ups"](../ENABLEMENT.md#patch-follow-ups-where-the-proper-fix-belongs).
+
+| Patch                          | Symptom (without it)                                                                                                   | Triggered by kernel construct          | Fix lives in |
+|--------------------------------|------------------------------------------------------------------------------------------------------------------------|----------------------------------------|--------------|
+| `semantic_shims`               | `'TritonSemantic' object has no attribute '_prepare_legacy_load'` (or `dot_precheck`, or `tl._unwrap_if_constexpr`)    | Any `tlx.async_load` or `tlx.async_dot`| utlx-py      |
+| `dispatch_visit_with`          | `with tlx.async_tasks():` blocks fall through to default codegen (silent — produces wrong IR)                          | `with tlx.async_tasks(): / async_task` | triton       |
+| `make_tensor_descriptor`       | `desc_ptr must be None or tlx.tensor_descriptor_ptr, got <class 'triton.language.core.constexpr'>`, or 5-vs-6-arg overload mismatch | `tlx.make_tensor_descriptor`  | utlx-py      |
+| `wgmma_use_acc_default`        | `create_warpgroup_mma(): incompatible function arguments` — `useAcc=None` rejected                                     | `tlx.async_dot`                        | utlx-py      |
+| `broadcast_shape_overload`     | `create_broadcast(): incompatible function arguments` — gluon overload takes `ir.type`, semantic passes shape list     | Any 2D-tensor expression (broadcasting)| triton (or disappears with the swap) |
+| `gluon_op_builder_swap`        | `'ir.builder' object has no attribute 'create_warpgroup_mma'` (or `create_local_alloc`, `create_memdesc_index`, `create_warp_specialize`, …) | `tlx.local_alloc`, `tlx.async_dot`, `tlx.async_tasks` | utlx-py |
+| `async_load_native`            | `'ttg.async_copy_global_to_local' op operand count (3) does not match with the total size (0) specified in attribute 'operandSegmentSizes'` | `tlx.async_load`           | utlx-py *or* utlx-cpp |
+| `wgmma_acc_layout_setup`       | `failed to legalize unresolved materialization from ('tensor<…,#blocked>') to ('tensor<…>')` in `TLXConvertTritonToTritonGPU` | `tlx.async_dot`                | utlx-cpp (partial — see below) |
+| `warp_specialize_codegen`      | `'WarpSpecializeOp' object has no attribute 'get_partition_region'` / `'append_operand'`                               | `with tlx.async_tasks(): / async_task` | utlx-py      |
+
+> **Outstanding wall:** Even with all patches active, `tiny_gemm.py` fails at
+> `TritonGPURemoveLayoutConversions` due to the output-side
+> `tlx.release_layout` marker — `wgmma_acc_layout_setup` only handles the
+> input side. See [`ENABLEMENT.md` → 47debefa](../ENABLEMENT.md#47debefa) for the
+> bisect run that established the minimum patch set, and the
+> [`utlx-cpp`](../ENABLEMENT.md#utlx-cpp--fix-in-next-wheel-rebuild-c) /
+> [`utlx-py`](../ENABLEMENT.md#utlx-py--fix-in-next-wheel-rebuild-python-only)
+> tables for fix paths.
 
 ## Diagnostic recipe
 

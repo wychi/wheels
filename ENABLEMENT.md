@@ -194,17 +194,16 @@ All 7 patches are required for this wheel.
 
 ### Bisect against `kernels/tiny_gemm.py`
 
-Followed the [Patch re-evaluation playbook](#patch-re-evaluation-playbook-run-on-every-new-wheel) — start with `__tlx_patches__ = []`, add the patch addressing each successive failure until the next failure can't be bridged.
+Followed the [Patch re-evaluation playbook](#patch-re-evaluation-playbook-run-on-every-new-wheel) — start with `__tlx_patches__ = []`, add the patch addressing each successive failure until the next failure can't be bridged. Symptom-to-patch mapping is documented in [`runner/CLAUDE.md` → "Patch catalog"](runner/CLAUDE.md#patch-catalog).
 
-| Step | Patch added                  | Resulting failure                                                              |
-|------|------------------------------|--------------------------------------------------------------------------------|
-| 0    | (none)                       | `'TritonSemantic' object has no attribute '_prepare_legacy_load'`              |
-| 1    | `semantic_shims`             | `'ir.builder' object has no attribute 'create_warpgroup_mma'`                  |
-| 2    | `gluon_op_builder_swap`      | `create_broadcast`: shape-list vs `ir.type` overload mismatch                  |
-| 3    | `broadcast_shape_overload`   | `create_warpgroup_mma`: `useAcc=None` rejected                                 |
-| 4    | `wgmma_use_acc_default`      | `ttg.async_copy_global_to_local` operand count mismatch (plugin C++ bug)       |
-| 5    | `async_load_native`          | TLXConvert: `tlx.require_layout` materialization wall                          |
-| 6    | `wgmma_acc_layout_setup`     | **WALL** — `TritonGPURemoveLayoutConversions` (`tlx.release_layout` leftover)  |
+Order in which patches were added (each addresses the failure left by the previous step):
+
+1. `semantic_shims`
+2. `gluon_op_builder_swap`
+3. `broadcast_shape_overload`
+4. `wgmma_use_acc_default`
+5. `async_load_native`
+6. `wgmma_acc_layout_setup` → **WALL** at `TritonGPURemoveLayoutConversions`
 
 ### Minimum required patches (this kernel)
 
