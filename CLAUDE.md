@@ -9,9 +9,12 @@ wheels/
 ├── dist/                    # Built wheels (all versions, flat)
 ├── triton/                  # Triton build script + docs
 ├── utlx/                    # uTLX build script + docs
-├── kernels/                 # Kernel runner + example kernels
-│   ├── runner.py            # uTLX setup, patches, run kernel
-│   └── tiny_gemm.py         # Example uTLX kernel
+├── kernels/                 # Example uTLX kernels
+│   └── tiny_gemm.py
+├── runner/                  # Kernel runner + API-bridge patches
+│   ├── runner.py            # uTLX setup + applies tlx_patches, runs kernel
+│   ├── tlx_patches.py       # Registry of monkey patches bridging API drift
+│   └── tlx_patches.toml     # Patch selection per utlx wheel commit
 ├── gpumode/                 # GPUMode competition bundle
 │   ├── install_deps.py      # Wheel URLs + install function
 │   └── make_submission.py   # Generate self-contained submission
@@ -33,7 +36,7 @@ wheels/
 python test_runner.py
 
 # Run a uTLX kernel (assumes wheels already installed)
-python kernels/runner.py kernels/tiny_gemm.py
+python runner/runner.py kernels/tiny_gemm.py
 
 # Generate a self-contained GPUMode submission
 python gpumode/make_submission.py submission.py -o submission_tlx.py
@@ -107,6 +110,20 @@ Build bottom-up (each step needs the one below it):
 - Use `--no-isolation` with `python -m build` (devserver blocks `pip`, use `uv pip`)
 - Set `TRITON_BUILD_UT=OFF` (avoids googletest download, network restricted)
 - Set `TRITON_BUILD_PROTON=OFF` (skip Proton build)
+
+## API Bridging (Monkey Patching)
+
+The pre-built `utlx_plugin` wheel was authored against an older Triton API and
+needs Python-side bridging to the currently-installed Triton's C++ bindings.
+That bridge layer lives in `runner/` as a registry of selectable patches —
+see [`runner/CLAUDE.md`](runner/CLAUDE.md) for the patch catalog, selection
+rules, and diagnostic recipes.
+
+## uTLX Enablement
+
+For commit-specific bug fixes, patch requirements, and enablement work, see
+[`ENABLEMENT.md`](ENABLEMENT.md). That document tracks issues and
+fixes organized by utlx wheel commit.
 
 ## Testing
 

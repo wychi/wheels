@@ -31,6 +31,11 @@ export TRITON_PLUGIN_PATHS=$(python -c 'import utlx_plugin, os; print(os.path.jo
 
 Both must be set **before** `import triton`.
 
+## Enablement
+
+For commit-specific bugs, fixes, and patch requirements, see
+[`../ENABLEMENT.md`](../ENABLEMENT.md).
+
 ## Known Test Issues
 
 - `test_tlx.py::test_clock64` — segfaults, excluded from core test suite
