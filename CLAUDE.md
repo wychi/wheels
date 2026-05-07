@@ -125,6 +125,12 @@ For commit-specific bug fixes, patch requirements, and enablement work, see
 [`ENABLEMENT.md`](ENABLEMENT.md). That document tracks issues and
 fixes organized by utlx wheel commit.
 
+To enable a new kernel against the current wheel — or hand the task to
+another agent — invoke the `enable-kernel` skill (auto-triggers on
+phrases like "enable this kernel" / "make this kernel work"). The full
+workflow lives in
+[`.claude/skills/enable-kernel/SKILL.md`](.claude/skills/enable-kernel/SKILL.md).
+
 ## Testing
 
 ```bash
