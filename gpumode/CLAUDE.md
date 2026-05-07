@@ -1,38 +1,62 @@
-# GPUMode Wheels
+# GPUMode
 
-Pre-built Python wheels for the GPUMode competition environment.
+Competition bundle for [GPUMode](https://gpumode.com/).
 
-## Environment
+## Runtime Environment (Modal container)
 
-The target runtime is a Modal container:
 - **Python**: 3.13
 - **CUDA**: 12.9.1 (devel, ubuntu24.04)
 - **PyTorch**: 2.11.0 (cu129)
 - **Package manager**: `uv` (via `.uv_pip_install`)
 
-## Triton Wheel
+## Required Wheels
 
-The official `triton==3.7.0` PyPI wheel has a bug that breaks uTLX plugin support. This project builds a patched Triton wheel from the `release/3.7.x` branch of `triton-lang/triton` with two fixes applied:
+Install from `dist/` (or from GitHub Releases):
 
-1. `CMakeLists.txt` — add `-Wno-attributes` to suppress build warnings
-2. `python/src/ir.cc` — fix plugin op builder to support return values (required for uTLX)
+- **Triton** — patched with `TRITON_EXT_ENABLED=ON` for uTLX plugin support
+- **uTLX** — Triton Language Extensions plugin
 
-## Build Dependencies
+## Usage in submission.py
 
-- **Python 3.13** — install via `uv python install 3.13`
-- **LLVM** — built from source at the commit specified in `triton/cmake/llvm-hash.txt`, with projects `mlir;lld` and targets `host;NVPTX;AMDGPU`
-- **CUDA toolchain** — ptxas 12.8 (Hopper), ptxas 13.1 (Blackwell), installed via `feature install cuda_13_1`
-- **Build tools** — `build`, `cmake`, `ninja`, `setuptools`, `wheel`, `pybind11` (install via `uv pip install`)
+### 1. Install wheels
 
-## Build Notes
+```python
+TRITON_WHEEL_URL = "https://github.com/wychi/wheels/releases/download/<tag>/triton-*.whl"
+UTLX_WHEEL_URL = "https://github.com/wychi/wheels/releases/download/<tag>/utlx-*.whl"
 
-- Use `--no-isolation` with `python -m build` because the devserver blocks `pip` (use `uv pip` instead)
-- Set `TRITON_BUILD_UT=OFF` to avoid googletest download (network restricted)
-- Set `TRITON_BUILD_PROTON=OFF` to skip Proton build
-- Set `LLVM_SYSPATH` to point to the local LLVM build directory
-- Set `TRITON_PTXAS_PATH`, `TRITON_PTXAS_BLACKWELL_PATH`, etc. to use local CUDA installations instead of downloading from NVIDIA
-- The full build script is in `README.md`
+subprocess.run([sys.executable, "-m", "pip", "install", "--force-reinstall",
+                f"triton @ {TRITON_WHEEL_URL}",
+                f"utlx @ {UTLX_WHEEL_URL}"])
+```
 
-## Hosting
+### 2. Set up uTLX plugin path
 
-Wheels are uploaded as GitHub Releases on `wychi/wheels` since they are too large (~327MB) for regular git.
+```python
+import os, sysconfig
+os.environ["TRITON_CACHE_PATH"] = os.path.expanduser("~/.triton")
+
+dist_packages = sysconfig.get_paths()["purelib"]
+os.environ["TRITON_PLUGIN_PATHS"] = os.path.join(dist_packages, "utlx_plugin", "libutlx.so")
+```
+
+Both must be set **before** `import triton`.
+
+### 3. Import and use
+
+```python
+import triton
+import triton.language as tl
+import utlx_plugin as tlx
+```
+
+### 4. Monkey-patches
+
+Some `triton.language` functions need patching for uTLX compatibility (see `submission.py` for `apply_tlx_patches()`). These patches provide `_unwrap_if_constexpr`, `_prepare_legacy_load`, `dot_precheck`, and `create_warpgroup_mma`.
+
+### 5. Generate submission
+
+```bash
+./make_submission.sh submission.py -o submission_tlx.py
+```
+
+This wraps a clean kernel file with install, plugin setup, and monkey-patch boilerplate.

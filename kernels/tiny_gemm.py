@@ -1,27 +1,12 @@
 #!/usr/bin/env python3
-"""
-uTLX tiny GEMM — clean kernel implementation (gpumode template).
+"""uTLX tiny GEMM using local_alloc + async_load + async_dot."""
 
-Expects Triton (patched) and uTLX to be installed with plugin path set.
-To generate a self-contained submission, run:
-    ./make_submission.sh submission.py > submission_tlx.py
-"""
-
-import builtins
 import sys
-from typing import Any, Optional, Tuple
-
 import torch
 import triton
 import triton.language as tl
-import triton.language.semantic as triton_semantic
-from triton import knobs
 import utlx_plugin as tlx
 
-
-# ---------------------------------------------------------------------------
-# Kernel
-# ---------------------------------------------------------------------------
 
 @triton.jit
 def tiny_gemm_kernel(
@@ -52,11 +37,8 @@ def tiny_gemm_kernel(
     c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
     tl.store(c_ptrs, c)
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
-def custom_kernel(data):
+def test_tiny_gemm():
     M, N, K = 128, 256, 64
     a = torch.randn((M, K), device="cuda", dtype=torch.float16)
     b = torch.randn((K, N), device="cuda", dtype=torch.float16)
@@ -72,11 +54,10 @@ def custom_kernel(data):
 
     ref = torch.matmul(a.float(), b.float()).half()
     rel_err = (c - ref).abs().max().item() / ref.abs().max().item()
-    print(f"[DEBUG] uTLX tiny GEMM rel_err={rel_err:.6f}", file=sys.stderr)
-    assert rel_err < 0.01, f"uTLX GEMM failed: rel_err={rel_err}"
-    print("--- uTLX PASS ---", file=sys.stderr)
-    return data
+    print(f"rel_err={rel_err:.6f}")
+    assert rel_err < 0.01, f"FAILED: rel_err={rel_err}"
+    print("PASS")
 
 
 if __name__ == "__main__":
-    custom_kernel({})
+    test_tiny_gemm()
