@@ -214,7 +214,7 @@ If the kernel passes:
 
 ## Quick reference
 
-- **Which wheel am I on?** `pip show utlx | awk '/^Version/ {print $2}'`
+- **Which wheel am I on?** `uv pip show utlx | awk '/^Version/ {print $2}'`
 - **Run the kernel:** `python runner/runner.py kernels/<X>.py 2>&1 | tail -40`
 - **Patch catalog:** `runner/CLAUDE.md` → "Patch catalog"
 - **Per-wheel history + bisect playbook:** `ENABLEMENT.md`
