@@ -1,10 +1,23 @@
 #!/usr/bin/env bash
-# gh_release.sh — Upload built wheels to GitHub Releases and record in
-# releases.json.
+# gh_release.sh — Test, then upload built wheels to GitHub Releases and
+# record the (triton, utlx) pair in releases.json.
 #
 # Usage:
-#   ./gh_release.sh                    # publish dist/triton-*.whl + dist/utlx-*.whl
-#   ./gh_release.sh <triton.whl> <utlx.whl>
+#   ./gh_release.sh
+#
+# Picks `dist/triton-*.whl` and `dist/utlx-*.whl` (one each — fails if more).
+#
+# Steps:
+#   1. Resolve the wheels in dist/.
+#   2. Refuse if releases.json already records this exact (triton, utlx)
+#      pair (any entry, not just the latest — re-publishing is wasteful and
+#      bloats the file).
+#   3. Run test_runner.py to install the wheels and exercise the core test
+#      suite. Skips publish if anything fails.
+#   4. Upload both wheels to GitHub Releases (creates the per-wheel tag if
+#      it doesn't exist; uploads with --clobber otherwise).
+#   5. Prepend a new entry to releases.json — make_submission.py reads
+#      index [0] (the most recent) when resolving wheel URLs.
 #
 # Requires GH_TOKEN in env (or `gh auth login` already done).
 
@@ -22,35 +35,80 @@ fi
 
 DIST_DIR="$SCRIPT_DIR/dist"
 
-if [ "$#" -ge 2 ]; then
-    TRITON_WHL="$1"
-    UTLX_WHL="$2"
-else
-    TRITON_WHL=$(ls "$DIST_DIR"/triton-*.whl 2>/dev/null | head -1)
-    UTLX_WHL=$(ls "$DIST_DIR"/utlx-*.whl 2>/dev/null | head -1)
-fi
+# Reuse test_runner.py's "exactly one wheel per name" rule by globbing the
+# same way it does and erroring if there are zero or multiple matches.
+shopt -s nullglob
+TRITON_MATCHES=("$DIST_DIR"/triton-*.whl)
+UTLX_MATCHES=("$DIST_DIR"/utlx-*.whl)
+shopt -u nullglob
 
-[ -f "$TRITON_WHL" ] || err "Triton wheel not found: ${TRITON_WHL:-(none)}"
-[ -f "$UTLX_WHL" ]   || err "uTLX wheel not found: ${UTLX_WHL:-(none)}"
+[ "${#TRITON_MATCHES[@]}" -eq 1 ] \
+    || err "Expected exactly one dist/triton-*.whl, found ${#TRITON_MATCHES[@]}. Run build_wheels.sh first."
+[ "${#UTLX_MATCHES[@]}" -eq 1 ] \
+    || err "Expected exactly one dist/utlx-*.whl, found ${#UTLX_MATCHES[@]}. Run build_wheels.sh first."
 
-log "Publishing:"
+TRITON_WHL="${TRITON_MATCHES[0]}"
+UTLX_WHL="${UTLX_MATCHES[0]}"
+
+TRITON_TAG=$(release_tag_from_wheel "$TRITON_WHL")
+UTLX_TAG=$(release_tag_from_wheel "$UTLX_WHL")
+
+# What URLs would `publish_wheel` produce? Mirrors env.sh:publish_wheel's
+# echo line. We compare against releases.json to detect re-runs.
+TRITON_URL_PREDICTED="https://github.com/$REPO/releases/download/$TRITON_TAG/$(basename "$TRITON_WHL")"
+UTLX_URL_PREDICTED="https://github.com/$REPO/releases/download/$UTLX_TAG/$(basename "$UTLX_WHL")"
+
+log "Wheels:"
 log "  $TRITON_WHL"
 log "  $UTLX_WHL"
 
+# ── duplicate check ──────────────────────────────────────────────────────────
+
+RELEASES_FILE="$SCRIPT_DIR/releases.json"
+if [ -f "$RELEASES_FILE" ]; then
+    if python3 - "$RELEASES_FILE" "$TRITON_URL_PREDICTED" "$UTLX_URL_PREDICTED" <<'PY'
+import json, sys
+path, triton_url, utlx_url = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    entries = json.load(f)
+for e in entries:
+    if e.get("triton") == triton_url and e.get("utlx") == utlx_url:
+        sys.exit(0)
+sys.exit(1)
+PY
+    then
+        err "This (triton, utlx) wheel pair is already recorded in $(basename "$RELEASES_FILE"). Aborting."
+    fi
+fi
+
+# ── test ─────────────────────────────────────────────────────────────────────
+
+log "Testing wheels (test_runner.py installs from dist/)..."
+setup_venv
+uv pip install pytest 2>&1 | tail -1
+"$PYTHON" "$SCRIPT_DIR/test_runner.py"
+
 # ── publish ──────────────────────────────────────────────────────────────────
 
-if ! TRITON_URL=$(publish_wheel "$TRITON_WHL" "$(release_tag_from_wheel "$TRITON_WHL")"); then
+log "Publishing..."
+
+if ! TRITON_URL=$(publish_wheel "$TRITON_WHL" "$TRITON_TAG"); then
     err "Failed to publish Triton wheel."
 fi
-if ! UTLX_URL=$(publish_wheel "$UTLX_WHL" "$(release_tag_from_wheel "$UTLX_WHL")"); then
+if ! UTLX_URL=$(publish_wheel "$UTLX_WHL" "$UTLX_TAG"); then
     err "Failed to publish uTLX wheel."
 fi
 
-# ── record ───────────────────────────────────────────────────────────────────
-# Prepend a new entry to releases.json. make_submission.py reads index [0]
-# (the most recent entry) when resolving wheel URLs.
+# Sanity: the URLs we recorded against in the dup check must match what
+# publish_wheel returned. If this trips, our prediction is wrong and the
+# dup check would falsely pass on re-run.
+[ "$TRITON_URL" = "$TRITON_URL_PREDICTED" ] \
+    || err "Predicted Triton URL ($TRITON_URL_PREDICTED) != published ($TRITON_URL)"
+[ "$UTLX_URL" = "$UTLX_URL_PREDICTED" ] \
+    || err "Predicted uTLX URL ($UTLX_URL_PREDICTED) != published ($UTLX_URL)"
 
-RELEASES_FILE="$SCRIPT_DIR/releases.json"
+# ── record ───────────────────────────────────────────────────────────────────
+
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 if [ -f "$RELEASES_FILE" ]; then
