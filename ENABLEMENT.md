@@ -218,20 +218,18 @@ Built from triton-ext commit `1d7b7482`. This is a newer wheel than `f3d635af`.
    ./release.sh <triton-ext-commit>
    ```
 
-2. **Test with existing patches:**
-   ```bash
-   python runner/runner.py kernels/tiny_gemm.py
-   python test_runner.py
-   ```
+2. **Re-evaluate the patch list** — see the [Patch re-evaluation
+   playbook](#patch-re-evaluation-playbook-run-on-every-new-wheel)
+   above. Bisect each patch to find which ones the new wheel obsoletes;
+   inheriting the previous commit's full list defeats the purpose of
+   rebuilding.
 
-3. **If tests pass with current patches:**
+3. **If the minimal list passes all tests:**
    - Add entry to `runner/tlx_patches.toml`:
      ```toml
      [utlx."<new-commit>"]
      patches = [
-         "semantic_shims",
-         "dispatch_visit_with",
-         # ... list only patches still needed
+         # Only the patches that still failed something during bisect.
      ]
      ```
 
@@ -356,6 +354,61 @@ Paths under `~/.venv/lib/python*/site-packages/utlx_plugin/` are inside the
 3. `triton` cluster — file an upstream issue for the `visit_With` hook; otherwise live with the patch.
 
 After step 1 + 2, only `dispatch_visit_with` (and possibly `broadcast_shape_overload`) should remain on the patch side.
+
+### Patch re-evaluation playbook (run on every new wheel)
+
+When a new wheel lands, do NOT just inherit the previous commit's patch
+list. Re-evaluate each patch — some may be obsolete. Procedure:
+
+1. **Install the new wheel** and confirm the version:
+   ```bash
+   pip show utlx | awk '/^Version/ {print $2}'
+   # → 0.1.0+git<new-commit>
+   ```
+
+2. **Bisect the patch list.** For each patch (in registration order),
+   try disabling it and re-running `kernels/tiny_gemm.py`:
+   ```bash
+   # Edit kernels/tiny_gemm.py to add at the top:
+   __tlx_patches__ = [<full list minus the one being tested>]
+   python runner/runner.py kernels/tiny_gemm.py
+   ```
+   - If it still passes → patch is **obsolete**, retire it.
+   - If it fails → patch is still load-bearing. Note which symptom returns.
+
+3. **Run the broader test suite** with the candidate minimal list:
+   ```bash
+   python test_runner.py
+   ```
+
+4. **For any retired patch**, set `default=False` in
+   `runner/tlx_patches.py` (don't delete — older wheels may still need
+   it). Update its docstring's `Retire when:` line to note the
+   retiring-wheel commit.
+
+5. **Add the new wheel's entry** to `runner/tlx_patches.toml`:
+   ```toml
+   [utlx."<new-commit>"]
+   patches = [
+       # Only the patches that still failed something during step 2.
+   ]
+   ```
+
+6. **Document the diff** under a new `## <new-commit>` section in this
+   file:
+   - What's fixed in the wheel since the previous commit (which patches
+     became obsolete and why).
+   - Any new failures and the fixes added (whether new patches or
+     wheel-side TODOs).
+   - Links to the relevant issues in the "Patch Follow-ups" tables above.
+
+7. **Update the commit index** at the top of this file with the new
+   entry.
+
+> **Why bisect each patch?** Patches accumulate over wheel versions and
+> retiring stale ones keeps the bridge layer minimal. A patch that was
+> needed for `f3d635af` may be exactly what `1d7b7482` fixed in C++ — but
+> there's no signal that obviates it unless we test.
 
 ---
 
