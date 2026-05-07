@@ -64,7 +64,7 @@ cat << 'PREAMBLE_INSTALL'
 
     print(f"[DEBUG] Python: {sys.version}", file=sys.stderr)
     print(f"[DEBUG] Installing triton from: {TRITON_WHEEL_URL}", file=sys.stderr)
-    result = subprocess.run(["uv", "pip", "install", "--force-reinstall",
+    result = subprocess.run([sys.executable, "-m", "pip", "install", "--force-reinstall",
                              f"triton @ {TRITON_WHEEL_URL}",
                              f"utlx @ {UTLX_WHEEL_URL}"],
                             capture_output=True, text=True)
