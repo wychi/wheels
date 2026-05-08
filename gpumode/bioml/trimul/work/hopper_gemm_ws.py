@@ -1736,6 +1736,33 @@ def tr_fwd(src, dst, B, N2, hd: tl.constexpr, TI: tl.constexpr):
 
 
 @triton.jit
+def tr_cast_fwd(
+    src_l_ptr,
+    src_r_ptr,
+    dst_l_ptr,
+    dst_r_ptr,
+    B,
+    N2,
+    hd: tl.constexpr,
+    TI: tl.constexpr,
+):
+    """Fused transpose + bf16->fp32 upcast for both L and R operands of the
+    einsum bmm. One kernel launch replaces 2× tr_fwd + 2× elementwise upcast,
+    cutting the [B*hd, N²] bf16 intermediate."""
+    pb = tl.program_id(0)
+    pi = tl.program_id(1)
+    ij = pi * TI + tl.arange(0, TI)
+    d = tl.arange(0, hd)
+    m = ij[:, None] < N2
+    src_off = (pb * N2 + ij[:, None]) * hd + d[None, :]
+    dst_off = (pb * hd + d[None, :]) * N2 + ij[:, None]
+    lv = tl.load(src_l_ptr + src_off, mask=m).to(tl.float32)
+    rv = tl.load(src_r_ptr + src_off, mask=m).to(tl.float32)
+    tl.store(dst_l_ptr + dst_off, lv, mask=m)
+    tl.store(dst_r_ptr + dst_off, rv, mask=m)
+
+
+@triton.jit
 def fused_invtr_ln_gate(
     bmm_ptr,
     og_ptr,
@@ -1817,22 +1844,21 @@ def custom_kernel(data: input_t) -> output_t:
     )
     del proj, mean, rstd, s1, s2
 
+    # Fused transpose + bf16->fp32 upcast — one kernel launch produces the
+    # fp32 [B*hd, N, N] bmm operands directly, replacing 2× tr_fwd (bf16 copy)
+    # plus 2× elementwise upcast. Saves the [B*hd, N²] bf16 intermediate
+    # (≈0.54 GB) and a kernel launch.
     TILE_IJ = 128
     tr_grid = (B, triton.cdiv(N2, TILE_IJ))
-    L = torch.empty(B * hd, N2, device=x_in.device, dtype=torch.bfloat16)
-    R = torch.empty(B * hd, N2, device=x_in.device, dtype=torch.bfloat16)
-    tr_fwd[tr_grid](lf, L, B, N2, hd=hd, TI=TILE_IJ, num_warps=4)
-    tr_fwd[tr_grid](rf, R, B, N2, hd=hd, TI=TILE_IJ, num_warps=4)
+    Lf = torch.empty(B * hd, N2, device=x_in.device, dtype=torch.float32)
+    Rf = torch.empty(B * hd, N2, device=x_in.device, dtype=torch.float32)
+    tr_cast_fwd[tr_grid](lf, rf, Lf, Rf, B, N2, hd=hd, TI=TILE_IJ, num_warps=4)
     del lf, rf
-
-    # Promote bmm to fp32 (TF32 via cuBLAS): bf16 bmm over K=seq_len accumulates
-    # ~sqrt(K)*0.4% relative error, which exceeds atol=2e-2 for sl ≥ 512 with
-    # cauchy-tailed values. TF32's 10-bit mantissa cuts that by ~10x.
-    # Keep result fp32 — fused_invtr_ln_gate now consumes fp32 directly,
-    # eliminating the 1.07 GB bf16 cast that costs ~1.5 ms on the largest shape.
-    Lf = L.view(B * hd, N, N).float()
-    Rf = R.view(B * hd, N, N).float()
-    del L, R
+    Lf = Lf.view(B * hd, N, N)
+    Rf = Rf.view(B * hd, N, N)
+    # bf16 bmm over K=seq_len accumulates ~sqrt(K)*0.4% relative error, which
+    # exceeds atol=2e-2 for sl ≥ 512 with cauchy-tailed values; keep fp32 via
+    # cuBLAS TF32. fused_invtr_ln_gate consumes the fp32 result directly.
     out_bmm = torch.bmm(Lf, Rf.transpose(-1, -2))
     del Lf, Rf
 

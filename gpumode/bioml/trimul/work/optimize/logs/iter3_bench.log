@@ -1,0 +1,10 @@
+[tlx_patches] applying gluon_op_builder_swap
+[tlx_patches] applying async_load_native
+[tlx_patches] applying warp_specialize_codegen
+OK  bs=2 sl= 256 dim=128 hd=128 mask=no dist=normal →   0.803 ms
+OK  bs=1 sl= 768 dim=128 hd=128 mask=no dist=cauchy →   3.452 ms
+OK  bs=2 sl= 256 dim=384 hd=128 mask=yes dist=normal →   1.162 ms
+OK  bs=1 sl= 512 dim=128 hd=128 mask=no dist=normal →   1.538 ms
+OK  bs=1 sl=1024 dim=128 hd=128 mask=no dist=cauchy →   6.081 ms
+OK  bs=1 sl= 768 dim=384 hd=128 mask=yes dist=normal →   4.988 ms
+OK  bs=1 sl=1024 dim=384 hd=128 mask=no dist=normal →   8.779 ms

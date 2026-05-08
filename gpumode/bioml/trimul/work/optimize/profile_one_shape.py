@@ -5,6 +5,7 @@ import sys
 import sysconfig
 import types
 
+_user_args = sys.argv[1:]
 sys.argv = [sys.argv[0], "--no-install"]
 dist_packages = sysconfig.get_paths()["purelib"]
 os.environ["TRITON_PLUGIN_PATHS"] = os.path.join(
@@ -40,7 +41,8 @@ triton.set_allocator(_alloc_fn)
 
 
 def main():
-    idx = int(sys.argv[2]) if len(sys.argv) > 2 else 4
+    idx_args = [a for a in _user_args if a != "--no-install"]
+    idx = int(idx_args[0]) if idx_args else 4
     shape = mod.BENCHMARK_SHAPES[idx]
     print(f"# Per-kernel breakdown — shape {idx}: {shape}")
     inp = mod._make_input_from_shape(shape)

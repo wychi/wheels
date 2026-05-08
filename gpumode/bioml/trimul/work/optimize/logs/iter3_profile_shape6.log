@@ -1,0 +1,12 @@
+# Per-kernel breakdown — shape 6: {'bs': 1, 'dim': 384, 'distribution': 'normal', 'hiddendim': 128, 'nomask': True, 'seqlen': 1024}
+void at::native::vectorized_elementwise_kernel<8, at...         0.00%       0.000us         0.00%       0.000us       0.000us      42.890ms        24.49%      42.890ms     714.836us            60  
+                                   matmul_kernel_tlx_ws         0.00%       0.000us         0.00%       0.000us       0.000us      22.884ms        13.07%      22.884ms       1.144ms            20  
+sm90_xmma_gemm_f32f32_tf32f32_f32_tn_n_tilesize128x1...         0.00%       0.000us         0.00%       0.000us       0.000us      22.003ms        12.57%      22.003ms       1.100ms            20  
+                                          fused_gate_ln         0.00%       0.000us         0.00%       0.000us       0.000us      19.315ms        11.03%      19.315ms     965.745us            20  
+sm90_xmma_gemm_f32f32_tf32f32_f32_tn_n_tilesize64x25...         0.00%       0.000us         0.00%       0.000us       0.000us      18.938ms        10.81%      18.938ms     946.892us            20  
+                                            tr_cast_fwd         0.00%       0.000us         0.00%       0.000us       0.000us      15.800ms         9.02%      15.800ms     789.975us            20  
+                                      ln_stats_multirow         0.00%       0.000us         0.00%       0.000us       0.000us      14.507ms         8.28%      14.507ms     725.372us            20  
+                                    fused_invtr_ln_gate         0.00%       0.000us         0.00%       0.000us       0.000us       9.435ms         5.39%       9.435ms     471.753us            20  
+void at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us       8.906ms         5.09%       8.906ms     445.314us            20  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us      65.918us         0.04%      65.918us       3.296us            20  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us      49.731us         0.03%      49.731us       2.487us            20  
