@@ -16,6 +16,7 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 | 7a | strided fused_gate_ln write (skip tr_fwd_pair) — **REVERTED** | 8.08 | (-58%) | Uncoalesced strided write tanked everything. |
 | 7b | replace TLX matmul with cuBLAS bf16 GEMM — **REVERTED (user preference: keep TLX)** | 5.12 | 1.89× | Measured equivalent perf; reverted at user request to keep TLX kernel as the optimization target. |
 | 8 | O6: fused inv-tr + LN + gate + H→D linear (`fused_invtr_ln_gate_proj`); dispatched only when dim==hd | 5.12 | 1.89× | D=128 shapes -5 to -6% (eliminates [T,hd] gated intermediate); D=384 keeps 2-kernel path (cuBLAS bf16 ≥ Triton fused for the wider GEMM). |
+| 9 | multi-row fused_gate_ln (BR=4) | 5.12 | 1.89× | Tiny (≤1%) on all shapes — kernel was already at ~2.2 TB/s HBM peak. Kept for cleaner amortization of launch latency. |
 
 ## Per-iteration log
 

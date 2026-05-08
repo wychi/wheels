@@ -1710,45 +1710,52 @@ def fused_gate_ln(
     s2_ptr,
     T,
     hd: tl.constexpr,
+    BR: tl.constexpr = 1,
 ):
-    t = tl.program_id(0)
+    """Apply LN affine + sigmoid + mask + gate-mul to the 5-projection output.
+
+    Vectorized over BR consecutive rows so each program does enough work to
+    hide kernel-launch + barrier latency. Within a program, threads compute
+    a [BR, hd] tile and the s1/s2 tables (length 5*hd) are reused BR times.
+    """
+    pid = tl.program_id(0)
+    r = pid * BR + tl.arange(0, BR)
+    r_ok = r < T
     d = tl.arange(0, hd)
-    base = t * 5 * hd
-    rs = tl.load(rstd_ptr + t)
-    mu = tl.load(mean_ptr + t)
-    lv_r = tl.load(proj_ptr + base + d).to(tl.float32)
-    lv = rs * (lv_r - mu * tl.load(s1_ptr + d)) + tl.load(s2_ptr + d)
-    rv_r = tl.load(proj_ptr + base + d + hd).to(tl.float32)
-    rv = rs * (rv_r - mu * tl.load(s1_ptr + d + hd)) + tl.load(s2_ptr + d + hd)
-    lg = tl.sigmoid(
-        rs
-        * (
-            tl.load(proj_ptr + base + d + 2 * hd).to(tl.float32)
-            - mu * tl.load(s1_ptr + d + 2 * hd)
-        )
-        + tl.load(s2_ptr + d + 2 * hd)
-    )
-    rg = tl.sigmoid(
-        rs
-        * (
-            tl.load(proj_ptr + base + d + 3 * hd).to(tl.float32)
-            - mu * tl.load(s1_ptr + d + 3 * hd)
-        )
-        + tl.load(s2_ptr + d + 3 * hd)
-    )
-    og_v = tl.sigmoid(
-        rs
-        * (
-            tl.load(proj_ptr + base + d + 4 * hd).to(tl.float32)
-            - mu * tl.load(s1_ptr + d + 4 * hd)
-        )
-        + tl.load(s2_ptr + d + 4 * hd)
-    )
-    m = tl.load(mask_ptr + t)
-    o = t * hd + d
-    tl.store(left_ptr + o, (lv * lg * m).to(tl.bfloat16))
-    tl.store(right_ptr + o, (rv * rg * m).to(tl.bfloat16))
-    tl.store(og_ptr + o, og_v.to(tl.bfloat16))
+
+    s1_l = tl.load(s1_ptr + d)
+    s2_l = tl.load(s2_ptr + d)
+    s1_r = tl.load(s1_ptr + d + hd)
+    s2_r = tl.load(s2_ptr + d + hd)
+    s1_lg = tl.load(s1_ptr + d + 2 * hd)
+    s2_lg = tl.load(s2_ptr + d + 2 * hd)
+    s1_rg = tl.load(s1_ptr + d + 3 * hd)
+    s2_rg = tl.load(s2_ptr + d + 3 * hd)
+    s1_og = tl.load(s1_ptr + d + 4 * hd)
+    s2_og = tl.load(s2_ptr + d + 4 * hd)
+
+    rs = tl.load(rstd_ptr + r, mask=r_ok, other=0.0)[:, None]
+    mu = tl.load(mean_ptr + r, mask=r_ok, other=0.0)[:, None]
+    base = r[:, None] * 5 * hd + d[None, :]
+    p_load_mask = r_ok[:, None]
+
+    lv_r = tl.load(proj_ptr + base, mask=p_load_mask).to(tl.float32)
+    rv_r = tl.load(proj_ptr + base + hd, mask=p_load_mask).to(tl.float32)
+    lg_r = tl.load(proj_ptr + base + 2 * hd, mask=p_load_mask).to(tl.float32)
+    rg_r = tl.load(proj_ptr + base + 3 * hd, mask=p_load_mask).to(tl.float32)
+    og_r = tl.load(proj_ptr + base + 4 * hd, mask=p_load_mask).to(tl.float32)
+
+    lv = rs * (lv_r - mu * s1_l[None, :]) + s2_l[None, :]
+    rv = rs * (rv_r - mu * s1_r[None, :]) + s2_r[None, :]
+    lg = tl.sigmoid(rs * (lg_r - mu * s1_lg[None, :]) + s2_lg[None, :])
+    rg = tl.sigmoid(rs * (rg_r - mu * s1_rg[None, :]) + s2_rg[None, :])
+    og_v = tl.sigmoid(rs * (og_r - mu * s1_og[None, :]) + s2_og[None, :])
+
+    m = tl.load(mask_ptr + r, mask=r_ok, other=0.0)[:, None]
+    o = r[:, None] * hd + d[None, :]
+    tl.store(left_ptr + o, (lv * lg * m).to(tl.bfloat16), mask=p_load_mask)
+    tl.store(right_ptr + o, (rv * rg * m).to(tl.bfloat16), mask=p_load_mask)
+    tl.store(og_ptr + o, og_v.to(tl.bfloat16), mask=p_load_mask)
 
 
 @triton.jit
@@ -1934,8 +1941,21 @@ def custom_kernel(data: input_t) -> output_t:
     lf = torch.empty(T, hd, device=x_in.device, dtype=torch.bfloat16)
     rf = torch.empty(T, hd, device=x_in.device, dtype=torch.bfloat16)
     out_gate = torch.empty(T, hd, device=x_in.device, dtype=torch.bfloat16)
-    fused_gate_ln[(T,)](
-        proj, mask_flat, lf, rf, out_gate, rstd, mean, s1, s2, T, hd=hd, num_warps=2
+    BR_GL = 4
+    fused_gate_ln[(triton.cdiv(T, BR_GL),)](
+        proj,
+        mask_flat,
+        lf,
+        rf,
+        out_gate,
+        rstd,
+        mean,
+        s1,
+        s2,
+        T,
+        hd=hd,
+        BR=BR_GL,
+        num_warps=4,
     )
     del proj, mean, rstd, s1, s2
 
