@@ -1868,9 +1868,7 @@ def custom_kernel(data: input_t) -> output_t:
     s1 = ln_w @ fat_f
     s2 = ln_b @ fat_f
     del fat_w, fat_f
-    # cuBLAS bf16 GEMM (fp32 accum) — comparable to the WS TLX kernel for this
-    # shape and avoids the bespoke kernel's 1-CTA-per-SM limitation.
-    proj = torch.matmul(x_flat, B_g)
+    proj = tlx_ws_matmul_fixed(x_flat, B_g, out_dtype=torch.bfloat16)
     del B_g
 
     mask_flat = mask.reshape(T).float()

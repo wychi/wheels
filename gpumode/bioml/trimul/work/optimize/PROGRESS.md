@@ -14,7 +14,7 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 | 5 | O1: bf16 einsum bmm (cuBLAS bf16 GEMM, fp32 accum) | 5.82 | **1.66×** | 13-20% per shape; cumulative 39.7% from baseline. Skip the fp32 cast on L,R; tr_cast_fwd → tr_fwd_pair (no upcast). bmm output now bf16 (LN inside fused_invtr_ln_gate reloads as fp32). |
 | 6 | O10: fold fp32→bf16 cast of x into ln_stats (`ln_stats_and_bf16_cast`) | 5.12 | **1.89×** | 6-13% per shape; cumulative 47.0% from baseline. Saves second read of [T,D] fp32. |
 | 7a | strided fused_gate_ln write (skip tr_fwd_pair) — **REVERTED** | 8.08 | (-58%) | Uncoalesced strided write tanked everything. |
-| 7b | replace TLX matmul with cuBLAS bf16 GEMM | 5.12 | 1.89× | -3.6% on shape 0, 0% on shape 6; cuBLAS ≈ TLX WS for the 5-proj GEMM. |
+| 7b | replace TLX matmul with cuBLAS bf16 GEMM — **REVERTED (user preference: keep TLX)** | 5.12 | 1.89× | Measured equivalent perf; reverted at user request to keep TLX kernel as the optimization target. |
 
 ## Per-iteration log
 
