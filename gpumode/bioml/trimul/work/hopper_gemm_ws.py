@@ -17,9 +17,17 @@ def _install_custom_deps(triton_url, utlx_url):
     print(f"[setup] Installing triton from: {triton_url}", file=sys.stderr)
     print(f"[setup] Installing utlx from: {utlx_url}", file=sys.stderr)
     result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--force-reinstall",
-         triton_url, utlx_url],
-        capture_output=True, text=True,
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--force-reinstall",
+            triton_url,
+            utlx_url,
+        ],
+        capture_output=True,
+        text=True,
     )
     print(f"[setup] pip exit code: {result.returncode}", file=sys.stderr)
     print(f"[setup] pip stdout: {result.stdout[-500:]}", file=sys.stderr)
@@ -31,7 +39,6 @@ def _install_custom_deps(triton_url, utlx_url):
 # --- uTLX setup (from runner.py) ---
 
 import os
-import sys
 import sysconfig
 
 
@@ -45,8 +52,12 @@ def _setup_utlx():
     os.environ["TRITON_PLUGIN_PATHS"] = libutlx_path
 
     if "triton" in sys.modules:
-        print("[runner] WARNING: triton imported before uTLX setup, reloading libtriton", file=sys.stderr)
+        print(
+            "[runner] WARNING: triton imported before uTLX setup, reloading libtriton",
+            file=sys.stderr,
+        )
         import importlib
+
         importlib.reload(sys.modules["triton"]._C.libtriton)
     else:
         import triton
@@ -54,17 +65,16 @@ def _setup_utlx():
     print(f"[runner] Triton {triton.__version__}", file=sys.stderr)
 
     import utlx_plugin as tlx
+
     print(f"[runner] uTLX loaded: {tlx.__file__}", file=sys.stderr)
 
 
 # --- Patch registry (from tlx_patches.py) ---
 
 import ast
-import os
-import sys
 import tomllib
 from dataclasses import dataclass
-from typing import Callable, Iterable, Optional, Union
+from typing import Callable, Iterable, Optional
 
 
 @dataclass
@@ -83,10 +93,8 @@ def register(name: str, *, default: bool = True):
 
     def decorator(fn: Callable[[], None]) -> Callable[[], None]:
         PATCHES.append(
-            _Patch(name=name,
-                   fn=fn,
-                   default=default,
-                   doc=(fn.__doc__ or "").strip()))
+            _Patch(name=name, fn=fn, default=default, doc=(fn.__doc__ or "").strip())
+        )
         return fn
 
     return decorator
@@ -94,8 +102,9 @@ def register(name: str, *, default: bool = True):
 
 def list_patches() -> list[tuple[str, bool, str]]:
     """Return [(name, default, first_doc_line)] for all registered patches."""
-    return [(p.name, p.default, p.doc.splitlines()[0] if p.doc else "")
-            for p in PATCHES]
+    return [
+        (p.name, p.default, p.doc.splitlines()[0] if p.doc else "") for p in PATCHES
+    ]
 
 
 def _all_default_names() -> list[str]:
@@ -127,14 +136,16 @@ def apply(names: Iterable[str], *, verbose: bool = True) -> list[str]:
 # Configuration resolution
 # ---------------------------------------------------------------------------
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "tlx_patches.toml")
+CONFIG_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tlx_patches.toml"
+)
 
 
 def _utlx_commit() -> str | None:
     """Return the local-segment commit of the installed utlx wheel, or None."""
     try:
         import importlib.metadata as m
+
         version = m.version("utlx")
     except Exception:
         return None
@@ -159,12 +170,9 @@ def _read_kernel_decl(kernel_file: str) -> list[str] | None:
         targets = []
         value = None
         if isinstance(node, ast.Assign):
-            targets = [
-                t.id for t in node.targets if isinstance(t, ast.Name)
-            ]
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
             value = node.value
-        elif isinstance(node, ast.AnnAssign) and isinstance(
-                node.target, ast.Name):
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             targets = [node.target.id]
             value = node.value
         if "__tlx_patches__" not in targets or value is None:
@@ -188,12 +196,13 @@ def _expand(spec) -> list[str]:
     if isinstance(spec, list):
         return [str(x) for x in spec]
     raise ValueError(
-        f"`patches` must be a list of names or the string 'all', got {spec!r}")
+        f"`patches` must be a list of names or the string 'all', got {spec!r}"
+    )
 
 
-def resolve_for_kernel(kernel_file: str | None = None,
-                       *,
-                       config_file: str = CONFIG_FILE) -> list[str]:
+def resolve_for_kernel(
+    kernel_file: str | None = None, *, config_file: str = CONFIG_FILE
+) -> list[str]:
     """Resolve the patch selection for a kernel run.
 
     Order: kernel decl > config commit match > config [default] > all defaults.
@@ -245,8 +254,7 @@ def _semantic_shims() -> None:
 
     def _prepare_legacy_load(self, ptr, mask, other, boundary_check, padding):
         if not ptr.type.scalar.is_ptr():
-            raise ValueError(
-                f"Unsupported ptr type {ptr.type.__repr__()} in `tl.load`")
+            raise ValueError(f"Unsupported ptr type {ptr.type.__repr__()} in `tl.load`")
         if mask is None and other is not None:
             raise ValueError("`other` cannot be provided without `mask`")
         if padding or boundary_check:
@@ -305,13 +313,14 @@ def _semantic_shims() -> None:
     ) -> Tuple[Any]:
         input_precision = tl._unwrap_if_constexpr(input_precision)
         allow_tf32 = tl._unwrap_if_constexpr(allow_tf32)
-        assert input_precision is None or tl._unwrap_if_constexpr(
-            allow_tf32) is None
+        assert input_precision is None or tl._unwrap_if_constexpr(allow_tf32) is None
         if input_precision is None:
             supports_tf32 = "tf32" in self.builder.options.allowed_dot_input_precisions
             input_precision = knobs.language.fp32_default or (
-                "tf32" if (supports_tf32 and
-                           (allow_tf32 or allow_tf32 is None)) else "ieee")
+                "tf32"
+                if (supports_tf32 and (allow_tf32 or allow_tf32 is None))
+                else "ieee"
+            )
         input_precision = tl._unwrap_if_constexpr(input_precision)
         out_dtype = tl._unwrap_if_constexpr(out_dtype)
         max_num_imprecise_acc = tl._unwrap_if_constexpr(max_num_imprecise_acc)
@@ -324,13 +333,15 @@ def _semantic_shims() -> None:
         input_precision = self._str_to_dot_input_precision(input_precision)
         lhs_rank = len(lhs.shape)
         assert lhs_rank == len(rhs.shape)
-        assert tl._unwrap_if_constexpr(
-            lhs.shape[-1]) == tl._unwrap_if_constexpr(rhs.shape[-2])
-        min_dot_size = self.builder.codegen_fns["min_dot_size"](lhs.type,
-                                                                rhs.type)
-        assert (tl._unwrap_if_constexpr(lhs.shape[-2]) >= min_dot_size[0]
-                and tl._unwrap_if_constexpr(lhs.shape[-1]) >= min_dot_size[2]
-                and tl._unwrap_if_constexpr(rhs.shape[-1]) >= min_dot_size[1])
+        assert tl._unwrap_if_constexpr(lhs.shape[-1]) == tl._unwrap_if_constexpr(
+            rhs.shape[-2]
+        )
+        min_dot_size = self.builder.codegen_fns["min_dot_size"](lhs.type, rhs.type)
+        assert (
+            tl._unwrap_if_constexpr(lhs.shape[-2]) >= min_dot_size[0]
+            and tl._unwrap_if_constexpr(lhs.shape[-1]) >= min_dot_size[2]
+            and tl._unwrap_if_constexpr(rhs.shape[-1]) >= min_dot_size[1]
+        )
         if lhs.type.scalar.is_int():
             _0 = self.builder.get_int32(0)
             ret_scalar_ty = tl.int32
@@ -338,8 +349,11 @@ def _semantic_shims() -> None:
             _0 = self.builder.get_fp32(0)
             ret_scalar_ty = tl.float32
         else:
-            _0 = self.builder.get_fp16(
-                0) if out_dtype.is_fp16() else self.builder.get_fp32(0)
+            _0 = (
+                self.builder.get_fp16(0)
+                if out_dtype.is_fp16()
+                else self.builder.get_fp32(0)
+            )
             ret_scalar_ty = out_dtype
         M = lhs.type.shape[-2]
         N = rhs.type.shape[-1]
@@ -347,19 +361,21 @@ def _semantic_shims() -> None:
         B = lhs.type.shape[0] if lhs_rank == 3 else None
         ret_ty = tl.block_type(ret_scalar_ty, [B, M, N] if B else [M, N])
         if acc is None:
-            acc_handle = self.builder.create_splat(ret_ty.to_ir(self.builder),
-                                                   _0)
+            acc_handle = self.builder.create_splat(ret_ty.to_ir(self.builder), _0)
         else:
             acc_handle = acc.handle
         if max_num_imprecise_acc is None:
-            max_num_imprecise_acc = self.builder.options.max_num_imprecise_acc_default if (
-                lhs.dtype.is_fp8() and rhs.dtype.is_fp8()) else 0
-        return (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc,
-                ret_ty)
+            max_num_imprecise_acc = (
+                self.builder.options.max_num_imprecise_acc_default
+                if (lhs.dtype.is_fp8() and rhs.dtype.is_fp8())
+                else 0
+            )
+        return (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc, ret_ty)
 
     setattr(tl, "_unwrap_if_constexpr", _unwrap_if_constexpr)
-    setattr(triton_semantic.TritonSemantic, "_prepare_legacy_load",
-            _prepare_legacy_load)
+    setattr(
+        triton_semantic.TritonSemantic, "_prepare_legacy_load", _prepare_legacy_load
+    )
     setattr(triton_semantic.TritonSemantic, "dot_precheck", dot_precheck)
 
 
@@ -466,29 +482,32 @@ def _make_tensor_descriptor() -> None:
 
     @tl_core.builtin
     @functools.wraps(utlx_plugin.make_tensor_descriptor)
-    def _patched(desc_ptr=None,
-                 base=None,
-                 shape=None,
-                 strides=None,
-                 block_shape=None,
-                 padding_option="zero",
-                 _semantic=None,
-                 **kwargs):
+    def _patched(
+        desc_ptr=None,
+        base=None,
+        shape=None,
+        strides=None,
+        block_shape=None,
+        padding_option="zero",
+        _semantic=None,
+        **kwargs,
+    ):
         desc_ptr = tl_core._unwrap_if_constexpr(desc_ptr)
         if desc_ptr is not None:
             raise NotImplementedError(
                 "make_tensor_descriptor with explicit desc_ptr requires the "
                 "7-arg create_make_tensor_descriptor binding which the "
                 "current wheel doesn't expose. Pass desc_ptr=None and let "
-                "the compiler auto-allocate via triton.set_allocator.")
+                "the compiler auto-allocate via triton.set_allocator."
+            )
         ndim = len(shape)
         assert 1 <= ndim <= 5
         assert len(strides) == ndim
         assert len(block_shape) == ndim
         shape_vals = [_semantic.make_scalar(x, tl_core.int32) for x in shape]
         strides_vals = [
-            _semantic.make_scalar(tl_core._unwrap_if_constexpr(x),
-                                  tl_core.int64) for x in strides
+            _semantic.make_scalar(tl_core._unwrap_if_constexpr(x), tl_core.int64)
+            for x in strides
         ]
         block_shape = tl_core._unwrap_shape(block_shape)
         block_type = tl_core.block_type(base.type.element_ty, block_shape)
@@ -500,16 +519,21 @@ def _make_tensor_descriptor() -> None:
         element_bitwidth = elt_ty.primitive_bitwidth
         rank = len(block_shape)
         swizzle = _default_nvmma_swizzle(block_shape, element_bitwidth)
-        layout_attr = builder.get_nvmma_shared_layout(swizzle,
-                                                     element_bitwidth,
-                                                     False, False, [], rank)
+        layout_attr = builder.get_nvmma_shared_layout(
+            swizzle, element_bitwidth, False, False, [], rank
+        )
         result_ty = builder.get_tensor_descriptor_layout_type(
-            block_type.to_ir(builder), is_signed_int, layout_attr)
-        handle = _gluon_create_mtd(builder, result_ty, base.handle,
-                                   [s.handle for s in shape_vals],
-                                   [s.handle for s in strides_vals], padding)
-        return tl_core.tensor_descriptor(handle, shape_vals, strides_vals,
-                                         block_type)
+            block_type.to_ir(builder), is_signed_int, layout_attr
+        )
+        handle = _gluon_create_mtd(
+            builder,
+            result_ty,
+            base.handle,
+            [s.handle for s in shape_vals],
+            [s.handle for s in strides_vals],
+            padding,
+        )
+        return tl_core.tensor_descriptor(handle, shape_vals, strides_vals, block_type)
 
     utlx_plugin.make_tensor_descriptor = _patched
     _utlx_mem_ops.make_tensor_descriptor = _patched
@@ -530,12 +554,10 @@ def _wgmma_use_acc_default() -> None:
 
     _orig = _gluon_ir.GluonOpBuilder.create_warpgroup_mma
 
-    def _patched(self, a, b, acc, use_acc, precision, max_num_imprecise,
-                 is_async):
+    def _patched(self, a, b, acc, use_acc, precision, max_num_imprecise, is_async):
         if use_acc is None:
             use_acc = self.get_int1(True)
-        return _orig(self, a, b, acc, use_acc, precision, max_num_imprecise,
-                     is_async)
+        return _orig(self, a, b, acc, use_acc, precision, max_num_imprecise, is_async)
 
     _gluon_ir.GluonOpBuilder.create_warpgroup_mma = _patched
 
@@ -597,43 +619,47 @@ def _gluon_op_builder_swap() -> None:
             return f"cuda:{int(arch[2:])}"
         return f"{options.backend_name}:{arch}"
 
-    def _patched_init(self,
-                      context,
-                      prototype,
-                      gscope,
-                      function_name,
-                      jit_fn,
-                      *,
-                      options,
-                      codegen_fns,
-                      module_map,
-                      is_gluon,
-                      module=None,
-                      is_kernel=False,
-                      function_types=None,
-                      noinline=False,
-                      caller_context=None,
-                      file_name=None,
-                      begin_line=0,
-                      begin_col=1):
-        _orig_init(self,
-                   context,
-                   prototype,
-                   gscope,
-                   function_name,
-                   jit_fn,
-                   options=options,
-                   codegen_fns=codegen_fns,
-                   module_map=module_map,
-                   is_gluon=is_gluon,
-                   module=module,
-                   is_kernel=is_kernel,
-                   function_types=function_types,
-                   noinline=noinline,
-                   caller_context=caller_context,
-                   file_name=file_name,
-                   begin_line=begin_line,
-                   begin_col=begin_col)
+    def _patched_init(
+        self,
+        context,
+        prototype,
+        gscope,
+        function_name,
+        jit_fn,
+        *,
+        options,
+        codegen_fns,
+        module_map,
+        is_gluon,
+        module=None,
+        is_kernel=False,
+        function_types=None,
+        noinline=False,
+        caller_context=None,
+        file_name=None,
+        begin_line=0,
+        begin_col=1,
+    ):
+        _orig_init(
+            self,
+            context,
+            prototype,
+            gscope,
+            function_name,
+            jit_fn,
+            options=options,
+            codegen_fns=codegen_fns,
+            module_map=module_map,
+            is_gluon=is_gluon,
+            module=module,
+            is_kernel=is_kernel,
+            function_types=function_types,
+            noinline=noinline,
+            caller_context=caller_context,
+            file_name=file_name,
+            begin_line=begin_line,
+            begin_col=begin_col,
+        )
         if not is_gluon:
             new_builder = gluon_ir.GluonOpBuilder(context)
             new_builder.set_loc(file_name, begin_line, begin_col)
@@ -648,22 +674,25 @@ def _gluon_op_builder_swap() -> None:
                 # to resolve warps-per-CTA) succeed mid-codegen. Mirrors
                 # `triton.experimental.gluon._runtime.GluonASTSource.make_ir`.
                 self.module.set_attr(
-                    "ttg.target",
-                    new_builder.get_string_attr(_target_name(options)))
+                    "ttg.target", new_builder.get_string_attr(_target_name(options))
+                )
                 self.module.set_attr(
-                    "ttg.num-warps",
-                    new_builder.get_int32_attr(options.num_warps))
+                    "ttg.num-warps", new_builder.get_int32_attr(options.num_warps)
+                )
                 self.module.set_attr(
-                    "ttg.num-ctas",
-                    new_builder.get_int32_attr(options.num_ctas))
+                    "ttg.num-ctas", new_builder.get_int32_attr(options.num_ctas)
+                )
                 self.module.set_attr(
                     "ttg.threads-per-warp",
-                    new_builder.get_int32_attr(options.warp_size))
-                if (options.backend_name == "cuda"
-                        and getattr(options, "maxnreg", None) is not None):
+                    new_builder.get_int32_attr(options.warp_size),
+                )
+                if (
+                    options.backend_name == "cuda"
+                    and getattr(options, "maxnreg", None) is not None
+                ):
                     self.module.set_attr(
-                        "ttg.maxnreg",
-                        new_builder.get_int32_attr(options.maxnreg))
+                        "ttg.maxnreg", new_builder.get_int32_attr(options.maxnreg)
+                    )
 
     cg.CodeGenerator.__init__ = _patched_init
 
@@ -705,30 +734,34 @@ def _async_load_native() -> None:
 
     @tl_core.builtin
     @functools.wraps(_orig_async_load)
-    def _patched_async_load(src,
-                            result,
-                            mask=None,
-                            other=None,
-                            cache_modifier: str = "",
-                            eviction_policy: str = "",
-                            is_volatile: bool = False,
-                            bulk: bool = False,
-                            bulk_size=None,
-                            barrier=None,
-                            _semantic=None):
+    def _patched_async_load(
+        src,
+        result,
+        mask=None,
+        other=None,
+        cache_modifier: str = "",
+        eviction_policy: str = "",
+        is_volatile: bool = False,
+        bulk: bool = False,
+        bulk_size=None,
+        barrier=None,
+        _semantic=None,
+    ):
         bulk = tl._unwrap_if_constexpr(bulk)
         if bulk:
-            return _orig_async_load(src,
-                                    result,
-                                    mask=mask,
-                                    other=other,
-                                    cache_modifier=cache_modifier,
-                                    eviction_policy=eviction_policy,
-                                    is_volatile=is_volatile,
-                                    bulk=bulk,
-                                    bulk_size=bulk_size,
-                                    barrier=barrier,
-                                    _semantic=_semantic)
+            return _orig_async_load(
+                src,
+                result,
+                mask=mask,
+                other=other,
+                cache_modifier=cache_modifier,
+                eviction_policy=eviction_policy,
+                is_volatile=is_volatile,
+                bulk=bulk,
+                bulk_size=bulk_size,
+                barrier=barrier,
+                _semantic=_semantic,
+            )
 
         mask = tl._unwrap_if_constexpr(mask)
         other = tl._unwrap_if_constexpr(other)
@@ -739,9 +772,11 @@ def _async_load_native() -> None:
 
         if src.type.is_ptr() and src.type.element_ty.is_block():
             raise NotImplementedError(
-                "async_load by block pointer is not supported yet")
+                "async_load by block pointer is not supported yet"
+            )
         _, src, mask, other, _ = _semantic._prepare_legacy_load(
-            src, mask, other, None, None)
+            src, mask, other, None, None
+        )
 
         cache = _semantic._str_to_load_cache_modifier(cache_modifier)
         evict = _semantic._str_to_eviction_policy(eviction_policy)
@@ -749,8 +784,14 @@ def _async_load_native() -> None:
         other_handle = other.handle if other is not None else _ir.value()
         # Native binding order: (smem_dest, ptr_src, mask, other, ...).
         _semantic.builder.create_async_copy_global_to_local(
-            result.handle, src.handle, mask_handle, other_handle, cache,
-            evict, bool(is_volatile))
+            result.handle,
+            src.handle,
+            mask_handle,
+            other_handle,
+            cache,
+            evict,
+            bool(is_volatile),
+        )
         return utlx_plugin.async_token(None)
 
     @tl_core.builtin
@@ -821,8 +862,10 @@ def _wgmma_acc_layout_setup() -> None:
     import triton.language.core as tl_core
     import utlx_plugin
     import utlx_plugin.mma_ops as _mma_ops
-    from utlx_plugin.mma_ops import (require_nv_mma_shared_layout,
-                                     require_dot_operand_layout)
+    from utlx_plugin.mma_ops import (
+        require_nv_mma_shared_layout,
+        require_dot_operand_layout,
+    )
 
     def _cuda_capability(arch):
         m = re.fullmatch(r"sm(\d+)", str(arch))
@@ -832,12 +875,56 @@ def _wgmma_acc_layout_setup() -> None:
 
     # Hopper wgmma N-tile candidates, mirroring _mmav3_acc_layout.
     _VALID_N_FP = [
-        256, 248, 240, 232, 224, 216, 208, 200, 192, 184, 176, 168, 160, 152,
-        144, 136, 128, 120, 112, 104, 96, 88, 80, 72, 64, 56, 48, 40, 32, 24,
-        16, 8
+        256,
+        248,
+        240,
+        232,
+        224,
+        216,
+        208,
+        200,
+        192,
+        184,
+        176,
+        168,
+        160,
+        152,
+        144,
+        136,
+        128,
+        120,
+        112,
+        104,
+        96,
+        88,
+        80,
+        72,
+        64,
+        56,
+        48,
+        40,
+        32,
+        24,
+        16,
+        8,
     ]
     _VALID_N_INT = [
-        224, 208, 192, 176, 160, 144, 128, 112, 96, 80, 64, 48, 32, 24, 16, 8
+        224,
+        208,
+        192,
+        176,
+        160,
+        144,
+        128,
+        112,
+        96,
+        80,
+        64,
+        48,
+        32,
+        24,
+        16,
+        8,
     ]
 
     def _mmav3_instr_and_warps(num_warps, c_shape, a_dtype):
@@ -855,7 +942,8 @@ def _wgmma_acc_layout_setup() -> None:
         if instr_shape is None:
             raise RuntimeError(
                 f"no valid wgmma instr shape for c_shape={c_shape}, "
-                f"a_dtype={a_dtype}, num_warps={num_warps}")
+                f"a_dtype={a_dtype}, num_warps={num_warps}"
+            )
         warps_per_tile = [4, 1]
         shape_per_warp = [16, instr_shape[1]]
         while True:
@@ -869,22 +957,26 @@ def _wgmma_acc_layout_setup() -> None:
 
     @tl_core.builtin
     @functools.wraps(utlx_plugin.async_dot)
-    def _patched_async_dot(A,
-                           B,
-                           acc=None,
-                           use_acc=None,
-                           pred=None,
-                           mBarriers=None,
-                           two_ctas=False,
-                           force_async=False,
-                           input_precision=None,
-                           out_dtype=tl.float32,
-                           _semantic=None):
+    def _patched_async_dot(
+        A,
+        B,
+        acc=None,
+        use_acc=None,
+        pred=None,
+        mBarriers=None,
+        two_ctas=False,
+        force_async=False,
+        input_precision=None,
+        out_dtype=tl.float32,
+        _semantic=None,
+    ):
         if mBarriers is None:
             mBarriers = []
-        (A, B, acc_handle, input_precision, max_num_imprecise_acc,
-         ret_ty) = _semantic.dot_precheck(A, B, acc, input_precision, None,
-                                          None, out_dtype, two_ctas)
+        (A, B, acc_handle, input_precision, max_num_imprecise_acc, ret_ty) = (
+            _semantic.dot_precheck(
+                A, B, acc, input_precision, None, None, out_dtype, two_ctas
+            )
+        )
         assert A.shape[0] >= 64, "M must be at least 64"
         assert A.shape[1] >= 16, "K must be at least 16"
         assert B.shape[1] >= 32, "N must be at least 32"
@@ -903,11 +995,14 @@ def _wgmma_acc_layout_setup() -> None:
                 force_async=force_async,
                 input_precision=input_precision,
                 out_dtype=out_dtype,
-                _semantic=_semantic)
+                _semantic=_semantic,
+            )
 
         # Hopper wgmma path.
-        if isinstance(A, utlx_plugin.buffered_tensor) and \
-                A.type.storage == utlx_plugin.storage_kind.smem:
+        if (
+            isinstance(A, utlx_plugin.buffered_tensor)
+            and A.type.storage == utlx_plugin.storage_kind.smem
+        ):
             A_handle = require_nv_mma_shared_layout(A, True, _semantic.builder)
         else:
             assert isinstance(A, tl.tensor)
@@ -919,10 +1014,10 @@ def _wgmma_acc_layout_setup() -> None:
         c_shape = list(ret_ty.shape)
         a_dtype = A.dtype
         instr_shape, warps_per_tile = _mmav3_instr_and_warps(
-            num_warps, c_shape, a_dtype)
+            num_warps, c_shape, a_dtype
+        )
 
-        mma_layout = builder.get_mma_layout([3, 0], warps_per_tile, [],
-                                            instr_shape)
+        mma_layout = builder.get_mma_layout([3, 0], warps_per_tile, [], instr_shape)
         # acc element type from ret_ty.
         elt_ir_ty = ret_ty.scalar.to_ir(builder)
         mma_acc_ty = builder.get_distributed_ty(elt_ir_ty, c_shape, mma_layout)
@@ -935,7 +1030,8 @@ def _wgmma_acc_layout_setup() -> None:
             zero = builder.get_int32(0)
         else:
             raise NotImplementedError(
-                f"async_dot acc dtype {ret_ty.scalar} not handled")
+                f"async_dot acc dtype {ret_ty.scalar} not handled"
+            )
         mma_acc_handle = builder.create_splat(mma_acc_ty, zero)
 
         if isinstance(A, tl.tensor):
@@ -943,10 +1039,15 @@ def _wgmma_acc_layout_setup() -> None:
 
         # use_acc=True is correct: 0 + a*b == a*b. Lets us also accept any
         # incoming acc value harmlessly (it's discarded).
-        output = builder.create_warpgroup_mma(A_handle, B_handle,
-                                              mma_acc_handle, None,
-                                              input_precision,
-                                              max_num_imprecise_acc, True)
+        output = builder.create_warpgroup_mma(
+            A_handle,
+            B_handle,
+            mma_acc_handle,
+            None,
+            input_precision,
+            max_num_imprecise_acc,
+            True,
+        )
         # Strip the mma encoding via utlx_release_layout so later passes
         # python-level ops (`.to()`, `tl.store`) — which reconstruct types
         # from `ret_ty` (no encoding) — see consistent IR. Note: this still
@@ -1058,26 +1159,27 @@ def _warp_specialize_codegen() -> None:
                         num_default += 1
                         if task.replicate > 1:
                             taskReplica.append(task.replicate - 1)
-                            taskNumWarps.extend([builder.options.num_warps] *
-                                                (task.replicate - 1))
+                            taskNumWarps.extend(
+                                [builder.options.num_warps] * (task.replicate - 1)
+                            )
                             if task.num_regs:
-                                taskNumRegs.extend([task.num_regs] *
-                                                   (task.replicate - 1))
+                                taskNumRegs.extend(
+                                    [task.num_regs] * (task.replicate - 1)
+                                )
                             if task.warp_group_start_id is not None:
                                 taskWarpGroupStartIds.extend(
-                                    [task.warp_group_start_id] *
-                                    (task.replicate - 1))
+                                    [task.warp_group_start_id] * (task.replicate - 1)
+                                )
                     else:
                         taskReplica.append(task.replicate)
                         taskNumWarps.extend([task.num_warps] * task.replicate)
                         if task.num_regs:
-                            taskNumRegs.extend([task.num_regs] *
-                                               task.replicate)
+                            taskNumRegs.extend([task.num_regs] * task.replicate)
                         if task.warp_group_start_id is not None:
                             for r in range(task.replicate):
                                 taskWarpGroupStartIds.append(
-                                    task.warp_group_start_id +
-                                    r * task.num_warps)
+                                    task.warp_group_start_id + r * task.num_warps
+                                )
                             perTaskNumWarps.append(task.num_warps)
                             perTaskStartIds.append(task.warp_group_start_id)
                             perTaskReplicates.append(task.replicate)
@@ -1090,16 +1192,20 @@ def _warp_specialize_codegen() -> None:
             assert len(taskWarpGroupStartIds) in [0, len(taskNumWarps)]
             if len(perTaskStartIds) > 0:
                 _ucg._validate_warp_group_start_ids(
-                    perTaskStartIds, perTaskNumWarps, perTaskReplicates,
-                    builder.options.num_warps)
+                    perTaskStartIds,
+                    perTaskNumWarps,
+                    perTaskReplicates,
+                    builder.options.num_warps,
+                )
 
             # First pass: discover used vars by emitting partition bodies into
             # scratch blocks then erasing.
             self._set_insertion_point_and_loc(ip, last_loc)
             for stmt in stmts:
                 task = _ucg._get_async_task(self, stmt)
-                task_replicate = (task.replicate -
-                                  1) if task.is_default else task.replicate
+                task_replicate = (
+                    (task.replicate - 1) if task.is_default else task.replicate
+                )
                 if task_replicate > 0:
                     scratch = builder.create_block()
                     region_replica_id_stack.append(0)
@@ -1109,8 +1215,9 @@ def _warp_specialize_codegen() -> None:
                     region_replica_id_stack.pop()
                     scratch.erase()
 
-            captures = sorted(name for name, val in liveins.items()
-                              if not _is_constexpr(val))
+            captures = sorted(
+                name for name, val in liveins.items() if not _is_constexpr(val)
+            )
             capture_handles = []
             for name in captures:
                 val = liveins[name]
@@ -1136,7 +1243,8 @@ def _warp_specialize_codegen() -> None:
                     continue
                 region_replica_id_stack.append(0)
                 default_block = builder.create_block_with_parent(
-                    ws_op.get_default_region(), [])
+                    ws_op.get_default_region(), []
+                )
                 builder.set_insertion_point_to_start(default_block)
                 with enter_sub_region(self):
                     self.visit(stmt)
@@ -1146,11 +1254,13 @@ def _warp_specialize_codegen() -> None:
                 break
 
             holder_block = builder.create_block_with_parent(
-                ws_op.get_partition_op_holder(), [])
+                ws_op.get_partition_op_holder(), []
+            )
             builder.set_insertion_point_to_start(holder_block)
             _sync_gb()
             partitions_op = gb.create_warp_specialize_partitions(
-                capture_handles, sum(taskReplica))
+                capture_handles, sum(taskReplica)
+            )
 
             index = 0
             for stmt in stmts:
@@ -1161,7 +1271,8 @@ def _warp_specialize_codegen() -> None:
                     partition_region = partitions_op.get_region(index)
                     index += 1
                     block = builder.create_block_with_parent(
-                        partition_region, arg_types)
+                        partition_region, arg_types
+                    )
                     builder.set_insertion_point_to_start(block)
                     with enter_sub_region(self):
                         self.visit(stmt)
@@ -1192,15 +1303,29 @@ def _warp_specialize_codegen() -> None:
     # Refresh dispatch table — it captured the old function reference at
     # import time.
     import triton.language.extra.tlx as _tlx_extra
+
     TLX_WITH_DISPATCH.clear()
     TLX_WITH_DISPATCH[_tlx_extra.async_tasks] = _patched
     TLX_WITH_DISPATCH[_tlx_extra.async_task] = _ucg.visit_withAsyncTask
     TLX_WITH_DISPATCH._initialized = True
 
 
-_install_custom_deps('https://github.com/wychi/wheels/releases/download/triton-3.7.0-7cff1f27/triton-3.7.0+git7cff1f27-cp313-cp313-linux_x86_64.whl', 'https://github.com/wychi/wheels/releases/download/utlx-0.1.0-cba4ef9a/utlx-0.1.0+gitcba4ef9a-cp313-cp313-linux_x86_64.whl')
+_install_custom_deps(
+    "https://github.com/wychi/wheels/releases/download/triton-3.7.0-7cff1f27/triton-3.7.0+git7cff1f27-cp313-cp313-linux_x86_64.whl",
+    "https://github.com/wychi/wheels/releases/download/utlx-0.1.0-cba4ef9a/utlx-0.1.0+gitcba4ef9a-cp313-cp313-linux_x86_64.whl",
+)
 _setup_utlx()
-apply(['semantic_shims', 'dispatch_visit_with', 'wgmma_use_acc_default', 'broadcast_shape_overload', 'gluon_op_builder_swap', 'async_load_native', 'warp_specialize_codegen'])
+apply(
+    [
+        "semantic_shims",
+        "dispatch_visit_with",
+        "wgmma_use_acc_default",
+        "broadcast_shape_overload",
+        "gluon_op_builder_swap",
+        "async_load_native",
+        "warp_specialize_codegen",
+    ]
+)
 
 
 # --- Kernel (from hopper_gemm_ws_src.py) ---
@@ -1222,7 +1347,6 @@ Patches and wheel install are injected by `gpumode/make_submission.py`; for
 local dev run via `python runner/runner.py kernels/hopper_gemm_ws.py`.
 """
 
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -1244,6 +1368,7 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 # Warp-specialized TLX GEMM kernel
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _get_bufidx_phase(accum_cnt, NUM_BUFFERS):
     bufIdx = accum_cnt % NUM_BUFFERS
@@ -1253,49 +1378,79 @@ def _get_bufidx_phase(accum_cnt, NUM_BUFFERS):
 
 @triton.jit
 def matmul_kernel_tlx_ws(
-        a_ptr, b_ptr, c_ptr,
-        M, N, K,
-        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-        GROUP_SIZE_M: tl.constexpr, NUM_STAGES: tl.constexpr,
-        NUM_MMA_WARPS: tl.constexpr, NUM_MMA_GROUPS: tl.constexpr,
-        EPILOGUE_SUBTILE: tl.constexpr, NUM_CTAS: tl.constexpr,
-        NUM_SMS: tl.constexpr, USE_WARP_BARRIER: tl.constexpr = False,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    NUM_MMA_WARPS: tl.constexpr,
+    NUM_MMA_GROUPS: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
+    NUM_CTAS: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    USE_WARP_BARRIER: tl.constexpr = False,
 ):
     BLOCK_M_SPLIT: tl.constexpr = BM // NUM_MMA_GROUPS
 
     a_desc = tlx.make_tensor_descriptor(
-        desc_ptr=None, base=a_ptr,
-        shape=[M, K], strides=[K, 1], block_shape=[BLOCK_M_SPLIT, BK])
+        desc_ptr=None,
+        base=a_ptr,
+        shape=[M, K],
+        strides=[K, 1],
+        block_shape=[BLOCK_M_SPLIT, BK],
+    )
     b_desc = tlx.make_tensor_descriptor(
-        desc_ptr=None, base=b_ptr,
-        shape=[K, N], strides=[N, 1], block_shape=[BK, BN // NUM_CTAS])
+        desc_ptr=None,
+        base=b_ptr,
+        shape=[K, N],
+        strides=[N, 1],
+        block_shape=[BK, BN // NUM_CTAS],
+    )
     if EPILOGUE_SUBTILE:
         c_desc = tlx.make_tensor_descriptor(
-            desc_ptr=None, base=c_ptr,
-            shape=[M, N], strides=[N, 1],
-            block_shape=[BLOCK_M_SPLIT, BN // 2])
+            desc_ptr=None,
+            base=c_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_M_SPLIT, BN // 2],
+        )
     else:
         c_desc = tlx.make_tensor_descriptor(
-            desc_ptr=None, base=c_ptr,
-            shape=[M, N], strides=[N, 1],
-            block_shape=[BLOCK_M_SPLIT, BN])
+            desc_ptr=None,
+            base=c_ptr,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[BLOCK_M_SPLIT, BN],
+        )
 
-    a = tlx.local_alloc((BLOCK_M_SPLIT, BK), tlx.dtype_of(a_ptr),
-                        NUM_STAGES * NUM_MMA_GROUPS)
+    a = tlx.local_alloc(
+        (BLOCK_M_SPLIT, BK), tlx.dtype_of(a_ptr), NUM_STAGES * NUM_MMA_GROUPS
+    )
     b = tlx.local_alloc((BK, BN), tlx.dtype_of(b_ptr), NUM_STAGES)
 
     if USE_WARP_BARRIER:
         bars_empty_a = tlx.alloc_warp_barrier(
-            num_barriers=NUM_STAGES * NUM_MMA_GROUPS, num_warps=4)
+            num_barriers=NUM_STAGES * NUM_MMA_GROUPS, num_warps=4
+        )
         bars_empty_b = tlx.alloc_warp_barrier(
-            num_barriers=NUM_STAGES, num_warps=4, num_arrivals=NUM_MMA_GROUPS)
+            num_barriers=NUM_STAGES, num_warps=4, num_arrivals=NUM_MMA_GROUPS
+        )
     else:
         bars_empty_a = tlx.alloc_barriers(
-            num_barriers=NUM_STAGES * NUM_MMA_GROUPS, arrive_count=1)
+            num_barriers=NUM_STAGES * NUM_MMA_GROUPS, arrive_count=1
+        )
         bars_empty_b = tlx.alloc_barriers(
-            num_barriers=NUM_STAGES, arrive_count=NUM_MMA_GROUPS)
+            num_barriers=NUM_STAGES, arrive_count=NUM_MMA_GROUPS
+        )
     bars_full_a = tlx.alloc_barriers(
-        num_barriers=NUM_STAGES * NUM_MMA_GROUPS, arrive_count=1)
+        num_barriers=NUM_STAGES * NUM_MMA_GROUPS, arrive_count=1
+    )
     bars_full_b = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
 
     if NUM_CTAS == 2:
@@ -1330,16 +1485,19 @@ def matmul_kernel_tlx_ws(
                     tlx.barrier_wait(bar=empty_a_1st, phase=p ^ 1)
                     tlx.barrier_expect_bytes(
                         full_a_1st,
-                        BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_ptr)))
+                        BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_ptr)),
+                    )
                     data_a_1st = tlx.local_view(a, buf)
-                    tlx.async_descriptor_load(a_desc, data_a_1st,
-                                              [offset_am, offset_k], full_a_1st)
+                    tlx.async_descriptor_load(
+                        a_desc, data_a_1st, [offset_am, offset_k], full_a_1st
+                    )
 
                     empty_b = tlx.local_view(bars_empty_b, buf)
                     full_b = tlx.local_view(bars_full_b, buf)
                     tlx.barrier_wait(bar=empty_b, phase=p ^ 1)
                     tlx.barrier_expect_bytes(
-                        full_b, BN * BK * tlx.size_of(tlx.dtype_of(a_ptr)))
+                        full_b, BN * BK * tlx.size_of(tlx.dtype_of(a_ptr))
+                    )
                     data_b = tlx.local_view(b, buf)
 
                     if NUM_CTAS == 2:
@@ -1351,25 +1509,35 @@ def matmul_kernel_tlx_ws(
                         if cta_id == 0:
                             buf_b_slice = tlx.local_slice(data_b, [0, 0], [BK, BN // 2])
                         else:
-                            buf_b_slice = tlx.local_slice(data_b, [0, BN // 2], [BK, BN // 2])
+                            buf_b_slice = tlx.local_slice(
+                                data_b, [0, BN // 2], [BK, BN // 2]
+                            )
                         tlx.async_descriptor_load(
-                            b_desc, buf_b_slice,
+                            b_desc,
+                            buf_b_slice,
                             [offset_k, offset_bn + cta_id * BN // 2],
-                            full_b, multicast_targets=[cta_id, cta_id ^ 1])
+                            full_b,
+                            multicast_targets=[cta_id, cta_id ^ 1],
+                        )
                     else:
-                        tlx.async_descriptor_load(b_desc, data_b,
-                                                  [offset_k, offset_bn], full_b)
+                        tlx.async_descriptor_load(
+                            b_desc, data_b, [offset_k, offset_bn], full_b
+                        )
 
                     empty_a_2nd = tlx.local_view(bars_empty_a, buf + NUM_STAGES)
                     full_a_2nd = tlx.local_view(bars_full_a, buf + NUM_STAGES)
                     tlx.barrier_wait(bar=empty_a_2nd, phase=p ^ 1)
                     tlx.barrier_expect_bytes(
                         bar=full_a_2nd,
-                        size=BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_ptr)))
+                        size=BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_ptr)),
+                    )
                     data_a_2nd = tlx.local_view(a, buf + NUM_STAGES)
                     tlx.async_descriptor_load(
-                        a_desc, data_a_2nd,
-                        [offset_am + BLOCK_M_SPLIT, offset_k], full_a_2nd)
+                        a_desc,
+                        data_a_2nd,
+                        [offset_am + BLOCK_M_SPLIT, offset_k],
+                        full_a_2nd,
+                    )
 
                     smem_accum_cnt += 1
                 tile_id += NUM_SMS
@@ -1398,21 +1566,22 @@ def matmul_kernel_tlx_ws(
                     buf, p = _get_bufidx_phase(smem_accum_cnt, NUM_STAGES)
 
                     full_a = tlx.local_view(
-                        bars_full_a,
-                        buf + NUM_STAGES * tlx.async_task_replica_id())
+                        bars_full_a, buf + NUM_STAGES * tlx.async_task_replica_id()
+                    )
                     full_b = tlx.local_view(bars_full_b, buf)
                     tlx.barrier_wait(bar=full_a, phase=p)
                     tlx.barrier_wait(bar=full_b, phase=p)
 
                     data_a = tlx.local_view(
-                        a, buf + NUM_STAGES * tlx.async_task_replica_id())
+                        a, buf + NUM_STAGES * tlx.async_task_replica_id()
+                    )
                     data_b = tlx.local_view(b, buf)
                     acc = tlx.async_dot(data_a, data_b, acc)
                     acc = tlx.async_dot_wait(tl.constexpr(0), acc)
 
                     empty_a = tlx.local_view(
-                        bars_empty_a,
-                        buf + NUM_STAGES * tlx.async_task_replica_id())
+                        bars_empty_a, buf + NUM_STAGES * tlx.async_task_replica_id()
+                    )
                     empty_b = tlx.local_view(bars_empty_b, buf)
                     tlx.barrier_arrive(empty_a)
                     tlx.barrier_arrive(empty_b)
@@ -1429,20 +1598,30 @@ def matmul_kernel_tlx_ws(
                     c1 = acc1.to(tlx.dtype_of(c_desc))
                     c_desc.store([offset_cm, offset_bn + BN // 2], c1)
                 else:
-                    c_desc.store([offset_cm, offset_bn],
-                                 acc.to(tlx.dtype_of(c_desc)))
+                    c_desc.store([offset_cm, offset_bn], acc.to(tlx.dtype_of(c_desc)))
 
                 tile_id += NUM_SMS
 
 
 def _alloc_fn(size: int, align: int, _: Optional[int]):
     return torch.empty(size, dtype=torch.int8, device=DEVICE)
+
+
 triton.set_allocator(_alloc_fn)
 
 NUM_SMS = torch.cuda.get_device_properties(DEVICE).multi_processor_count
-TLX_CONFIG = dict(BM=256, BN=128, BK=64, GROUP_SIZE_M=1, NUM_STAGES=3,
-                  NUM_MMA_WARPS=8, NUM_MMA_GROUPS=2, EPILOGUE_SUBTILE=False,
-                  NUM_CTAS=1, USE_WARP_BARRIER=False)
+TLX_CONFIG = dict(
+    BM=256,
+    BN=128,
+    BK=64,
+    GROUP_SIZE_M=1,
+    NUM_STAGES=3,
+    NUM_MMA_WARPS=8,
+    NUM_MMA_GROUPS=2,
+    EPILOGUE_SUBTILE=False,
+    NUM_CTAS=1,
+    USE_WARP_BARRIER=False,
+)
 
 
 def tlx_ws_matmul_fixed(a, b, out_dtype=torch.bfloat16):
@@ -1453,8 +1632,9 @@ def tlx_ws_matmul_fixed(a, b, out_dtype=torch.bfloat16):
     cfg = TLX_CONFIG
     num_tiles = triton.cdiv(M, cfg["BM"]) * triton.cdiv(N, cfg["BN"])
     grid = (min(NUM_SMS, num_tiles),)
-    matmul_kernel_tlx_ws[grid](a, b, c, M, N, K,
-                               NUM_SMS=NUM_SMS, num_stages=1, num_warps=4, **cfg)
+    matmul_kernel_tlx_ws[grid](
+        a, b, c, M, N, K, NUM_SMS=NUM_SMS, num_stages=1, num_warps=4, **cfg
+    )
     return c
 
 
@@ -1462,63 +1642,138 @@ def tlx_ws_matmul_fixed(a, b, out_dtype=torch.bfloat16):
 # Pre/post-matmul helper kernels
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
-def ln_stats_multirow(x_ptr, mean_ptr, rstd_ptr, T, dim: tl.constexpr, eps: tl.constexpr, BD: tl.constexpr, BR: tl.constexpr):
-    pid = tl.program_id(0); c = tl.arange(0, BD); m = c < dim
+def ln_stats_multirow(
+    x_ptr,
+    mean_ptr,
+    rstd_ptr,
+    T,
+    dim: tl.constexpr,
+    eps: tl.constexpr,
+    BD: tl.constexpr,
+    BR: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    c = tl.arange(0, BD)
+    m = c < dim
     for i in range(BR):
         r = pid * BR + i
         if r < T:
-            x = tl.load(x_ptr + r*dim + c, mask=m, other=0.0).to(tl.float32)
-            mu = tl.sum(x)/dim; xc = x - mu
+            x = tl.load(x_ptr + r * dim + c, mask=m, other=0.0).to(tl.float32)
+            mu = tl.sum(x) / dim
+            xc = x - mu
             tl.store(mean_ptr + r, mu)
-            tl.store(rstd_ptr + r, tl.rsqrt(tl.sum(xc*xc)/dim + eps))
+            tl.store(rstd_ptr + r, tl.rsqrt(tl.sum(xc * xc) / dim + eps))
 
 
 @triton.jit
-def fused_gate_ln(proj_ptr, mask_ptr, left_ptr, right_ptr, og_ptr,
-    rstd_ptr, mean_ptr, s1_ptr, s2_ptr, T, hd: tl.constexpr):
-    t = tl.program_id(0); d = tl.arange(0, hd); base = t*5*hd
-    rs = tl.load(rstd_ptr + t); mu = tl.load(mean_ptr + t)
-    lv_r=tl.load(proj_ptr+base+d).to(tl.float32)
-    lv=rs*(lv_r - mu*tl.load(s1_ptr+d)) + tl.load(s2_ptr+d)
-    rv_r=tl.load(proj_ptr+base+d+hd).to(tl.float32)
-    rv=rs*(rv_r - mu*tl.load(s1_ptr+d+hd)) + tl.load(s2_ptr+d+hd)
-    lg=tl.sigmoid(rs*(tl.load(proj_ptr+base+d+2*hd).to(tl.float32) - mu*tl.load(s1_ptr+d+2*hd)) + tl.load(s2_ptr+d+2*hd))
-    rg=tl.sigmoid(rs*(tl.load(proj_ptr+base+d+3*hd).to(tl.float32) - mu*tl.load(s1_ptr+d+3*hd)) + tl.load(s2_ptr+d+3*hd))
-    og_v=tl.sigmoid(rs*(tl.load(proj_ptr+base+d+4*hd).to(tl.float32) - mu*tl.load(s1_ptr+d+4*hd)) + tl.load(s2_ptr+d+4*hd))
-    m=tl.load(mask_ptr+t); o=t*hd+d
-    tl.store(left_ptr+o,(lv*lg*m).to(tl.bfloat16))
-    tl.store(right_ptr+o,(rv*rg*m).to(tl.bfloat16))
-    tl.store(og_ptr+o,og_v.to(tl.bfloat16))
+def fused_gate_ln(
+    proj_ptr,
+    mask_ptr,
+    left_ptr,
+    right_ptr,
+    og_ptr,
+    rstd_ptr,
+    mean_ptr,
+    s1_ptr,
+    s2_ptr,
+    T,
+    hd: tl.constexpr,
+):
+    t = tl.program_id(0)
+    d = tl.arange(0, hd)
+    base = t * 5 * hd
+    rs = tl.load(rstd_ptr + t)
+    mu = tl.load(mean_ptr + t)
+    lv_r = tl.load(proj_ptr + base + d).to(tl.float32)
+    lv = rs * (lv_r - mu * tl.load(s1_ptr + d)) + tl.load(s2_ptr + d)
+    rv_r = tl.load(proj_ptr + base + d + hd).to(tl.float32)
+    rv = rs * (rv_r - mu * tl.load(s1_ptr + d + hd)) + tl.load(s2_ptr + d + hd)
+    lg = tl.sigmoid(
+        rs
+        * (
+            tl.load(proj_ptr + base + d + 2 * hd).to(tl.float32)
+            - mu * tl.load(s1_ptr + d + 2 * hd)
+        )
+        + tl.load(s2_ptr + d + 2 * hd)
+    )
+    rg = tl.sigmoid(
+        rs
+        * (
+            tl.load(proj_ptr + base + d + 3 * hd).to(tl.float32)
+            - mu * tl.load(s1_ptr + d + 3 * hd)
+        )
+        + tl.load(s2_ptr + d + 3 * hd)
+    )
+    og_v = tl.sigmoid(
+        rs
+        * (
+            tl.load(proj_ptr + base + d + 4 * hd).to(tl.float32)
+            - mu * tl.load(s1_ptr + d + 4 * hd)
+        )
+        + tl.load(s2_ptr + d + 4 * hd)
+    )
+    m = tl.load(mask_ptr + t)
+    o = t * hd + d
+    tl.store(left_ptr + o, (lv * lg * m).to(tl.bfloat16))
+    tl.store(right_ptr + o, (rv * rg * m).to(tl.bfloat16))
+    tl.store(og_ptr + o, og_v.to(tl.bfloat16))
 
 
 @triton.jit
 def tr_fwd(src, dst, B, N2, hd: tl.constexpr, TI: tl.constexpr):
-    pb=tl.program_id(0); pi=tl.program_id(1); ij=pi*TI+tl.arange(0,TI); d=tl.arange(0,hd); m=ij[:,None]<N2
-    tl.store(dst+(pb*hd+d[None,:])*N2+ij[:,None], tl.load(src+(pb*N2+ij[:,None])*hd+d[None,:],mask=m), mask=m)
+    pb = tl.program_id(0)
+    pi = tl.program_id(1)
+    ij = pi * TI + tl.arange(0, TI)
+    d = tl.arange(0, hd)
+    m = ij[:, None] < N2
+    tl.store(
+        dst + (pb * hd + d[None, :]) * N2 + ij[:, None],
+        tl.load(src + (pb * N2 + ij[:, None]) * hd + d[None, :], mask=m),
+        mask=m,
+    )
 
 
 @triton.jit
-def fused_invtr_ln_gate(bmm_ptr, og_ptr, w_ptr, b_ptr, out_ptr,
-    B, N2, hd: tl.constexpr, eps: tl.constexpr, TI: tl.constexpr):
-    pb=tl.program_id(0); pi=tl.program_id(1)
-    ij=pi*TI+tl.arange(0,TI); d=tl.arange(0,hd); ij_ok=ij<N2
-    x=tl.load(bmm_ptr+(pb*hd+d[None,:])*N2+ij[:,None],mask=ij_ok[:,None]).to(tl.float32)
-    mu=tl.sum(x,axis=1)/hd; xc=x-mu[:,None]
-    xn=xc*tl.rsqrt(tl.sum(xc*xc,axis=1)[:,None]/hd+eps)
-    x_ln=xn*tl.load(w_ptr+d)[None,:]+tl.load(b_ptr+d)[None,:]
-    t_off=pb*N2+ij; og_addr=t_off[:,None]*hd+d[None,:]
-    og_val=tl.load(og_ptr+og_addr,mask=ij_ok[:,None]).to(tl.float32)
-    tl.store(out_ptr+og_addr,(x_ln*og_val).to(tl.bfloat16),mask=ij_ok[:,None])
+def fused_invtr_ln_gate(
+    bmm_ptr,
+    og_ptr,
+    w_ptr,
+    b_ptr,
+    out_ptr,
+    B,
+    N2,
+    hd: tl.constexpr,
+    eps: tl.constexpr,
+    TI: tl.constexpr,
+):
+    pb = tl.program_id(0)
+    pi = tl.program_id(1)
+    ij = pi * TI + tl.arange(0, TI)
+    d = tl.arange(0, hd)
+    ij_ok = ij < N2
+    x = tl.load(
+        bmm_ptr + (pb * hd + d[None, :]) * N2 + ij[:, None], mask=ij_ok[:, None]
+    ).to(tl.float32)
+    mu = tl.sum(x, axis=1) / hd
+    xc = x - mu[:, None]
+    xn = xc * tl.rsqrt(tl.sum(xc * xc, axis=1)[:, None] / hd + eps)
+    x_ln = xn * tl.load(w_ptr + d)[None, :] + tl.load(b_ptr + d)[None, :]
+    t_off = pb * N2 + ij
+    og_addr = t_off[:, None] * hd + d[None, :]
+    og_val = tl.load(og_ptr + og_addr, mask=ij_ok[:, None]).to(tl.float32)
+    tl.store(out_ptr + og_addr, (x_ln * og_val).to(tl.bfloat16), mask=ij_ok[:, None])
 
 
 # ---------------------------------------------------------------------------
 # Submission entry point
 # ---------------------------------------------------------------------------
 
+
 def custom_kernel(data: input_t) -> output_t:
     x_in, mask, W, cfg = data
-    dim, hd = cfg['dim'], cfg['hidden_dim']
+    dim, hd = cfg["dim"], cfg["hidden_dim"]
     B, N = x_in.shape[0], x_in.shape[1]
     T = B * N * N
     N2 = N * N
@@ -1528,18 +1783,25 @@ def custom_kernel(data: input_t) -> output_t:
 
     mean = torch.empty(T, device=x_in.device, dtype=torch.float32)
     rstd = torch.empty(T, device=x_in.device, dtype=torch.float32)
-    ln_stats_multirow[(triton.cdiv(T, 4),)](x_flat, mean, rstd, T, dim=dim, eps=1e-5, BD=BD, BR=4, num_warps=1)
+    ln_stats_multirow[(triton.cdiv(T, 4),)](
+        x_flat, mean, rstd, T, dim=dim, eps=1e-5, BD=BD, BR=4, num_warps=1
+    )
 
-    ln_w, ln_b = W['norm.weight'], W['norm.bias']
-    fat_w = torch.cat([
-        W['left_proj.weight'], W['right_proj.weight'],
-        W['left_gate.weight'], W['right_gate.weight'],
-        W['out_gate.weight'],
-    ], 0).T.contiguous()
+    ln_w, ln_b = W["norm.weight"], W["norm.bias"]
+    fat_w = torch.cat(
+        [
+            W["left_proj.weight"],
+            W["right_proj.weight"],
+            W["left_gate.weight"],
+            W["right_gate.weight"],
+            W["out_gate.weight"],
+        ],
+        0,
+    ).T.contiguous()
     fat_f = fat_w.float()
     B_g = (ln_w[:, None] * fat_f).to(torch.bfloat16).contiguous()
-    s1 = (ln_w @ fat_f)
-    s2 = (ln_b @ fat_f)
+    s1 = ln_w @ fat_f
+    s2 = ln_b @ fat_f
     del fat_w, fat_f
     if x_flat.dtype != torch.bfloat16:
         x_flat = x_flat.to(torch.bfloat16)
@@ -1550,8 +1812,9 @@ def custom_kernel(data: input_t) -> output_t:
     lf = torch.empty(T, hd, device=x_in.device, dtype=torch.bfloat16)
     rf = torch.empty(T, hd, device=x_in.device, dtype=torch.bfloat16)
     out_gate = torch.empty(T, hd, device=x_in.device, dtype=torch.bfloat16)
-    fused_gate_ln[(T,)](proj, mask_flat, lf, rf, out_gate,
-                        rstd, mean, s1, s2, T, hd=hd, num_warps=2)
+    fused_gate_ln[(T,)](
+        proj, mask_flat, lf, rf, out_gate, rstd, mean, s1, s2, T, hd=hd, num_warps=2
+    )
     del proj, mean, rstd, s1, s2
 
     TILE_IJ = 128
@@ -1575,14 +1838,23 @@ def custom_kernel(data: input_t) -> output_t:
     tr_grid6 = (B, triton.cdiv(N2, TI6))
     gated = torch.empty(T, hd, device=x_in.device, dtype=torch.bfloat16)
     fused_invtr_ln_gate[tr_grid6](
-        out_bmm.reshape(B * hd, N2), out_gate,
-        W['to_out_norm.weight'], W['to_out_norm.bias'],
-        gated, B, N2, hd=hd, eps=1e-5, TI=TI6, num_warps=4)
+        out_bmm.reshape(B * hd, N2),
+        out_gate,
+        W["to_out_norm.weight"],
+        W["to_out_norm.bias"],
+        gated,
+        B,
+        N2,
+        hd=hd,
+        eps=1e-5,
+        TI=TI6,
+        num_warps=4,
+    )
     del out_bmm, out_gate
 
     # Final projection in fp32 too — cheap (hd→dim is small) and lets cuBLAS
     # use TF32 instead of bf16, removing the last big precision-loss step.
-    out_fp32 = F.linear(gated.float(), W['to_out.weight'].float())
+    out_fp32 = F.linear(gated.float(), W["to_out.weight"].float())
     return out_fp32.to(torch.bfloat16).view(B, N, N, dim)
 
 
@@ -1592,21 +1864,73 @@ def custom_kernel(data: input_t) -> output_t:
 
 # Official benchmark suite from the trimul leaderboard.
 BENCHMARK_SHAPES = [
-    {"bs": 2, "dim": 128, "distribution": "normal", "hiddendim": 128, "nomask": True,  "seqlen": 256},
-    {"bs": 1, "dim": 128, "distribution": "cauchy", "hiddendim": 128, "nomask": True,  "seqlen": 768},
-    {"bs": 2, "dim": 384, "distribution": "normal", "hiddendim": 128, "nomask": False, "seqlen": 256},
-    {"bs": 1, "dim": 128, "distribution": "normal", "hiddendim": 128, "nomask": True,  "seqlen": 512},
-    {"bs": 1, "dim": 128, "distribution": "cauchy", "hiddendim": 128, "nomask": True,  "seqlen": 1024},
-    {"bs": 1, "dim": 384, "distribution": "normal", "hiddendim": 128, "nomask": False, "seqlen": 768},
-    {"bs": 1, "dim": 384, "distribution": "normal", "hiddendim": 128, "nomask": True,  "seqlen": 1024},
+    {
+        "bs": 2,
+        "dim": 128,
+        "distribution": "normal",
+        "hiddendim": 128,
+        "nomask": True,
+        "seqlen": 256,
+    },
+    {
+        "bs": 1,
+        "dim": 128,
+        "distribution": "cauchy",
+        "hiddendim": 128,
+        "nomask": True,
+        "seqlen": 768,
+    },
+    {
+        "bs": 2,
+        "dim": 384,
+        "distribution": "normal",
+        "hiddendim": 128,
+        "nomask": False,
+        "seqlen": 256,
+    },
+    {
+        "bs": 1,
+        "dim": 128,
+        "distribution": "normal",
+        "hiddendim": 128,
+        "nomask": True,
+        "seqlen": 512,
+    },
+    {
+        "bs": 1,
+        "dim": 128,
+        "distribution": "cauchy",
+        "hiddendim": 128,
+        "nomask": True,
+        "seqlen": 1024,
+    },
+    {
+        "bs": 1,
+        "dim": 384,
+        "distribution": "normal",
+        "hiddendim": 128,
+        "nomask": False,
+        "seqlen": 768,
+    },
+    {
+        "bs": 1,
+        "dim": 384,
+        "distribution": "normal",
+        "hiddendim": 128,
+        "nomask": True,
+        "seqlen": 1024,
+    },
 ]
 
 
 def _sample_input(generator, shape, dtype=torch.float32):
     """Draw fp32 noise per the leaderboard's `distribution` field."""
     if shape == "normal":
-        return torch.randn(generator=generator, *(), device=DEVICE, dtype=dtype) \
-            if False else None  # placeholder; helper below builds via sizes
+        return (
+            torch.randn(generator=generator, *(), device=DEVICE, dtype=dtype)
+            if False
+            else None
+        )  # placeholder; helper below builds via sizes
     raise RuntimeError("unreachable")
 
 
@@ -1620,6 +1944,7 @@ def _make_input_from_shape(shape, seed=0):
     All tensors fp32; the kernel handles casts internally.
     """
     import math
+
     bs, sl = shape["bs"], shape["seqlen"]
     dim, hd = shape["dim"], shape["hiddendim"]
 
@@ -1627,11 +1952,15 @@ def _make_input_from_shape(shape, seed=0):
     fp32 = torch.float32
 
     if shape["distribution"] == "normal":
-        x_in = torch.randn(bs, sl, sl, dim, generator=g, device=DEVICE,
-                           dtype=fp32).contiguous()
+        x_in = torch.randn(
+            bs, sl, sl, dim, generator=g, device=DEVICE, dtype=fp32
+        ).contiguous()
     elif shape["distribution"] == "cauchy":
-        x_in = torch.distributions.Cauchy(0, 2).sample(
-            (bs, sl, sl, dim)).to(device=DEVICE, dtype=fp32)
+        x_in = (
+            torch.distributions.Cauchy(0, 2)
+            .sample((bs, sl, sl, dim))
+            .to(device=DEVICE, dtype=fp32)
+        )
     else:
         raise ValueError(f"unknown distribution: {shape['distribution']}")
 
@@ -1646,18 +1975,18 @@ def _make_input_from_shape(shape, seed=0):
     inv_hd = 1.0 / math.sqrt(hd)
     inv_dim = 1.0 / math.sqrt(dim)
     W = {
-        'norm.weight':         _rn(dim),
-        'norm.bias':           _rn(dim),
-        'left_proj.weight':    _rn(hd, dim, scale=inv_hd),
-        'right_proj.weight':   _rn(hd, dim, scale=inv_hd),
-        'left_gate.weight':    _rn(hd, dim, scale=inv_hd),
-        'right_gate.weight':   _rn(hd, dim, scale=inv_hd),
-        'out_gate.weight':     _rn(hd, dim, scale=inv_hd),
-        'to_out_norm.weight':  _rn(hd),
-        'to_out_norm.bias':    _rn(hd),
-        'to_out.weight':       _rn(dim, hd, scale=inv_dim),
+        "norm.weight": _rn(dim),
+        "norm.bias": _rn(dim),
+        "left_proj.weight": _rn(hd, dim, scale=inv_hd),
+        "right_proj.weight": _rn(hd, dim, scale=inv_hd),
+        "left_gate.weight": _rn(hd, dim, scale=inv_hd),
+        "right_gate.weight": _rn(hd, dim, scale=inv_hd),
+        "out_gate.weight": _rn(hd, dim, scale=inv_hd),
+        "to_out_norm.weight": _rn(hd),
+        "to_out_norm.bias": _rn(hd),
+        "to_out.weight": _rn(dim, hd, scale=inv_dim),
     }
-    cfg = {'dim': dim, 'hidden_dim': hd}
+    cfg = {"dim": dim, "hidden_dim": hd}
     return (x_in, mask, W, cfg)
 
 
@@ -1667,9 +1996,12 @@ def _check_tile_divisibility(shape):
     K = shape["dim"]
     N = 5 * shape["hiddendim"]
     msgs = []
-    if M % TLX_CONFIG["BM"]: msgs.append(f"M={M} %BM={TLX_CONFIG['BM']}!=0")
-    if K % TLX_CONFIG["BK"]: msgs.append(f"K={K} %BK={TLX_CONFIG['BK']}!=0")
-    if N % TLX_CONFIG["BN"]: msgs.append(f"N={N} %BN={TLX_CONFIG['BN']}!=0")
+    if M % TLX_CONFIG["BM"]:
+        msgs.append(f"M={M} %BM={TLX_CONFIG['BM']}!=0")
+    if K % TLX_CONFIG["BK"]:
+        msgs.append(f"K={K} %BK={TLX_CONFIG['BK']}!=0")
+    if N % TLX_CONFIG["BN"]:
+        msgs.append(f"N={N} %BN={TLX_CONFIG['BN']}!=0")
     return ", ".join(msgs) if msgs else None
 
 
@@ -1678,21 +2010,31 @@ def _ref_kernel(data):
     `make_match_reference` uses rtol=2e-2, atol=2e-2 against this.
     """
     x, mask, W, cfg = data
-    dim, hd = cfg['dim'], cfg['hidden_dim']
+    dim, hd = cfg["dim"], cfg["hidden_dim"]
     x = x.float()
     # LayerNorm
     mu = x.mean(-1, keepdim=True)
     var = x.var(-1, keepdim=True, unbiased=False)
-    x_n = (x - mu) * torch.rsqrt(var + 1e-5) * W['norm.weight'] + W['norm.bias']
+    x_n = (x - mu) * torch.rsqrt(var + 1e-5) * W["norm.weight"] + W["norm.bias"]
     m = mask.float().unsqueeze(-1)
-    left  = F.linear(x_n, W['left_proj.weight'])  * m * torch.sigmoid(F.linear(x_n, W['left_gate.weight']))
-    right = F.linear(x_n, W['right_proj.weight']) * m * torch.sigmoid(F.linear(x_n, W['right_gate.weight']))
-    out_gate = torch.sigmoid(F.linear(x_n, W['out_gate.weight']))
-    out = torch.einsum('...ikd,...jkd->...ijd', left, right)
+    left = (
+        F.linear(x_n, W["left_proj.weight"])
+        * m
+        * torch.sigmoid(F.linear(x_n, W["left_gate.weight"]))
+    )
+    right = (
+        F.linear(x_n, W["right_proj.weight"])
+        * m
+        * torch.sigmoid(F.linear(x_n, W["right_gate.weight"]))
+    )
+    out_gate = torch.sigmoid(F.linear(x_n, W["out_gate.weight"]))
+    out = torch.einsum("...ikd,...jkd->...ijd", left, right)
     mu2 = out.mean(-1, keepdim=True)
     var2 = out.var(-1, keepdim=True, unbiased=False)
-    out_n = (out - mu2) * torch.rsqrt(var2 + 1e-5) * W['to_out_norm.weight'] + W['to_out_norm.bias']
-    return F.linear(out_n * out_gate, W['to_out.weight'])
+    out_n = (out - mu2) * torch.rsqrt(var2 + 1e-5) * W["to_out_norm.weight"] + W[
+        "to_out_norm.bias"
+    ]
+    return F.linear(out_n * out_gate, W["to_out.weight"])
 
 
 def _check_vs_ref(shape, seed=0, atol=2e-2, rtol=2e-2):
@@ -1730,9 +2072,11 @@ def _bench_one(shape, warmup=3, iters=10):
     ms = start.elapsed_time(end) / iters
     finite = torch.isfinite(out.float()).all().item()
     flag = "OK " if finite else "NaN"
-    return (f"{flag} bs={shape['bs']} sl={shape['seqlen']:4d} dim={shape['dim']} "
-            f"hd={shape['hiddendim']} mask={'no' if shape['nomask'] else 'yes'} "
-            f"dist={shape['distribution']:6s} → {ms:7.3f} ms")
+    return (
+        f"{flag} bs={shape['bs']} sl={shape['seqlen']:4d} dim={shape['dim']} "
+        f"hd={shape['hiddendim']} mask={'no' if shape['nomask'] else 'yes'} "
+        f"dist={shape['distribution']:6s} → {ms:7.3f} ms"
+    )
 
 
 def _smoke_test():
@@ -1740,12 +2084,14 @@ def _smoke_test():
     x_in, _, _, cfg = data
     B, N = x_in.shape[0], x_in.shape[1]
     out = custom_kernel(data)
-    expected = (B, N, N, cfg['dim'])
+    expected = (B, N, N, cfg["dim"])
     assert tuple(out.shape) == expected, f"shape {tuple(out.shape)} != {expected}"
     assert out.dtype == torch.bfloat16, f"dtype {out.dtype} != bfloat16"
     assert torch.isfinite(out.float()).all().item(), "output contains NaN/Inf"
-    print(f"PASS  shape={tuple(out.shape)} dtype={out.dtype} "
-          f"abs_mean={out.float().abs().mean().item():.4f}")
+    print(
+        f"PASS  shape={tuple(out.shape)} dtype={out.dtype} "
+        f"abs_mean={out.float().abs().mean().item():.4f}"
+    )
 
 
 def _verify_all():
@@ -1756,13 +2102,16 @@ def _verify_all():
             continue
         n_bad, max_err = _check_vs_ref(s, seed=42)
         flag = "OK " if n_bad == 0 else "FAIL"
-        print(f"{flag} bs={s['bs']} sl={s['seqlen']:4d} dim={s['dim']} "
-              f"hd={s['hiddendim']} mask={'no' if s['nomask'] else 'yes'} "
-              f"dist={s['distribution']:6s}  bad={n_bad:6d}  max_err={max_err:.4f}")
+        print(
+            f"{flag} bs={s['bs']} sl={s['seqlen']:4d} dim={s['dim']} "
+            f"hd={s['hiddendim']} mask={'no' if s['nomask'] else 'yes'} "
+            f"dist={s['distribution']:6s}  bad={n_bad:6d}  max_err={max_err:.4f}"
+        )
 
 
 if __name__ == "__main__":
     import sys
+
     if "--bench" in sys.argv:
         for s in BENCHMARK_SHAPES:
             print(_bench_one(s))

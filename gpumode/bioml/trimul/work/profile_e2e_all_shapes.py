@@ -4,19 +4,20 @@ Runs hopper_gemm_ws.py's full pipeline (LN-stats + 5-proj GEMM + gate-LN +
 2x tr_fwd + bmm + invtr-LN-gate + F.linear) for each shape and reports
 median wall time, throughput, and per-kernel breakdown via torch.profiler.
 """
+
 import os
 import sys
 import sysconfig
-import importlib.util
 import statistics
-from pathlib import Path
 
 # Tell hopper_gemm_ws.py's _install_custom_deps() to skip pip install
 sys.argv = [sys.argv[0], "--no-install"]
 
 # uTLX setup BEFORE importing triton (kernel module's _setup_utlx() also does this)
 dist_packages = sysconfig.get_paths()["purelib"]
-os.environ["TRITON_PLUGIN_PATHS"] = os.path.join(dist_packages, "utlx_plugin", "libutlx.so")
+os.environ["TRITON_PLUGIN_PATHS"] = os.path.join(
+    dist_packages, "utlx_plugin", "libutlx.so"
+)
 
 import triton  # noqa
 import utlx_plugin  # noqa
@@ -29,6 +30,7 @@ tlx_patches.apply(tlx_patches.resolve_for_kernel(KERNEL_FILE))
 
 # Load kernel module via exec, stubbing out the buggy _setup_utlx() (we already set things up)
 import types
+
 src = open(KERNEL_FILE).read()
 src = src.replace("_setup_utlx()\n", "pass  # _setup_utlx() stubbed by wrapper\n")
 mod = types.ModuleType("hopper_gemm_ws")
@@ -38,14 +40,18 @@ sys.modules["hopper_gemm_ws"] = mod
 
 import torch
 
+
 # Triton allocator for runtime-allocated scratch
 def _alloc_fn(size, align, stream):
-    return torch.empty(size, dtype=torch.int8, device='cuda')
+    return torch.empty(size, dtype=torch.int8, device="cuda")
+
+
 triton.set_allocator(_alloc_fn)
 
 # ----------------------------------------------------------------------------
 # Per-shape timing
 # ----------------------------------------------------------------------------
+
 
 def time_shape(shape_idx: int, shape: dict, n_warmup: int = 3, n_iters: int = 30):
     """Time custom_kernel on one shape; return median ms and throughput."""
@@ -105,6 +111,7 @@ def time_shape(shape_idx: int, shape: dict, n_warmup: int = 3, n_iters: int = 30
 # Per-kernel breakdown for one representative shape (largest, D=384)
 # ----------------------------------------------------------------------------
 
+
 def kernel_breakdown(shape: dict, n_iters: int = 20):
     inp = mod._make_input_from_shape(shape)
     fn = mod.custom_kernel
@@ -131,14 +138,21 @@ def kernel_breakdown(shape: dict, n_iters: int = 20):
 # Main
 # ----------------------------------------------------------------------------
 
+
 def main():
     print(f"# TriMul end-to-end profile — {KERNEL_FILE}")
-    print(f"# Triton {triton.__version__}, torch {torch.__version__}, GPU {torch.cuda.get_device_name(0)}")
+    print(
+        f"# Triton {triton.__version__}, torch {torch.__version__}, GPU {torch.cuda.get_device_name(0)}"
+    )
     print()
 
     print("## Per-shape end-to-end")
-    print("| # | bs | seqlen | dim | hd | mask | dist | ms (med) | ms (p10–p90) | TF/s e2e | max abs err | mean abs err |")
-    print("|---|----|--------|-----|----|------|------|----------|--------------|----------|-------------|--------------|")
+    print(
+        "| # | bs | seqlen | dim | hd | mask | dist | ms (med) | ms (p10–p90) | TF/s e2e | max abs err | mean abs err |"
+    )
+    print(
+        "|---|----|--------|-----|----|------|------|----------|--------------|----------|-------------|--------------|"
+    )
 
     results = []
     for i, shape in enumerate(mod.BENCHMARK_SHAPES):

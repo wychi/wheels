@@ -5,6 +5,7 @@ import torch
 from torch import nn, einsum
 from task import input_t, output_t
 
+
 class TriMul(nn.Module):
     def __init__(
         self,
@@ -52,10 +53,14 @@ class TriMul(nn.Module):
         left = left * left_gate
         right = right * right_gate
 
-        out = einsum('... i k d, ... j k d -> ... i j d', left.to(torch.bfloat16), right.to(torch.bfloat16))
+        out = einsum(
+            "... i k d, ... j k d -> ... i j d",
+            left.to(torch.bfloat16),
+            right.to(torch.bfloat16),
+        )
         # This einsum is the same as the following:
         # out = torch.zeros(batch_size, seq_len, seq_len, dim, device=x.device)
-        
+
         # # Compute using nested loops
         # for b in range(batch_size):
         #     for i in range(seq_len):
@@ -73,7 +78,7 @@ class TriMul(nn.Module):
 def custom_kernel(data: input_t) -> output_t:
     """
     Reference implementation of TriMul using PyTorch.
-    
+
     Args:
         data: Tuple of (input: torch.Tensor, mask: torch.Tensor, weights: Dict[str, torch.Tensor], config: Dict)
             - input: Input tensor of shape [batch_size, seq_len, seq_len, dim]
@@ -85,16 +90,28 @@ def custom_kernel(data: input_t) -> output_t:
     trimul = TriMul(config["dim"], config["hidden_dim"]).to(input_tensor.device)
 
     # Fill in the given weights of the model
-    trimul.norm.weight = nn.Parameter(weights['norm.weight'].to(torch.float32))
-    trimul.left_proj.weight = nn.Parameter(weights['left_proj.weight'].to(torch.float32))
-    trimul.right_proj.weight = nn.Parameter(weights['right_proj.weight'].to(torch.float32))
-    trimul.left_gate.weight = nn.Parameter(weights['left_gate.weight'].to(torch.float32))
-    trimul.right_gate.weight = nn.Parameter(weights['right_gate.weight'].to(torch.float32))
-    trimul.out_gate.weight = nn.Parameter(weights['out_gate.weight'].to(torch.float32))
-    trimul.to_out_norm.weight = nn.Parameter(weights['to_out_norm.weight'].to(torch.float32))
-    trimul.to_out.weight = nn.Parameter(weights['to_out.weight'].to(torch.float32))
-    trimul.norm.bias = nn.Parameter(weights['norm.bias'].to(torch.float32))
-    trimul.to_out_norm.bias = nn.Parameter(weights['to_out_norm.bias'].to(torch.float32))
+    trimul.norm.weight = nn.Parameter(weights["norm.weight"].to(torch.float32))
+    trimul.left_proj.weight = nn.Parameter(
+        weights["left_proj.weight"].to(torch.float32)
+    )
+    trimul.right_proj.weight = nn.Parameter(
+        weights["right_proj.weight"].to(torch.float32)
+    )
+    trimul.left_gate.weight = nn.Parameter(
+        weights["left_gate.weight"].to(torch.float32)
+    )
+    trimul.right_gate.weight = nn.Parameter(
+        weights["right_gate.weight"].to(torch.float32)
+    )
+    trimul.out_gate.weight = nn.Parameter(weights["out_gate.weight"].to(torch.float32))
+    trimul.to_out_norm.weight = nn.Parameter(
+        weights["to_out_norm.weight"].to(torch.float32)
+    )
+    trimul.to_out.weight = nn.Parameter(weights["to_out.weight"].to(torch.float32))
+    trimul.norm.bias = nn.Parameter(weights["norm.bias"].to(torch.float32))
+    trimul.to_out_norm.bias = nn.Parameter(
+        weights["to_out_norm.bias"].to(torch.float32)
+    )
 
     output = trimul(input_tensor, mask).to(torch.float32)
 

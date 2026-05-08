@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Pre-commit hook for the trimul project.
+# Runs `ruff format --check` and `ruff check` on staged Python files
+# under gpumode/bioml/trimul/. Other parts of the repo are not touched.
+#
+# Install: gpumode/bioml/trimul/scripts/install-hooks.sh
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+TRIMUL="gpumode/bioml/trimul"
+
+# Find ruff: prefer project venv, fall back to PATH
+RUFF=""
+for cand in \
+    "$REPO_ROOT/.venv/bin/ruff" \
+    "$(command -v ruff || true)"; do
+    if [ -x "$cand" ]; then RUFF="$cand"; break; fi
+done
+
+if [ -z "$RUFF" ]; then
+    echo "[pre-commit] ruff not found in .venv or PATH — skipping. Install with: uv pip install ruff"
+    exit 0
+fi
+
+# Staged Python files under trimul/, excluding the auto-generated kernel
+files=$(git diff --cached --name-only --diff-filter=ACM \
+    | grep -E "^${TRIMUL}/.*\.py$" \
+    | grep -v "${TRIMUL}/work/hopper_gemm_ws.py" \
+    || true)
+
+if [ -z "$files" ]; then
+    exit 0
+fi
+
+cd "$REPO_ROOT"
+
+echo "[pre-commit] ruff format --check on $(echo "$files" | wc -l) file(s)"
+if ! "$RUFF" format --check $files; then
+    echo
+    echo "[pre-commit] FAIL: run 'ruff format' to fix, then re-stage."
+    exit 1
+fi
+
+echo "[pre-commit] ruff check"
+if ! "$RUFF" check $files; then
+    echo
+    echo "[pre-commit] FAIL: fix lint errors above (or run 'ruff check --fix'), then re-stage."
+    exit 1
+fi

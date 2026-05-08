@@ -52,3 +52,21 @@ trimul/
 - All shape numbers use `B = batch_size, S = seq_len, D = dim, H = hidden_dim`. `H = 128` always.
 - "Subgraph 1 / S1" = norm + 5 projections + gates; "Einsum" = `i k d, j k d → i j d`; "Subgraph 3 / S3" = norm + gate + final projection.
 - Cauchy distribution in 2/7 benchmark shapes ⇒ bf16 for inputs throughout, never fp8.
+
+## Dev setup
+
+Python formatting + linting via [ruff](https://docs.astral.sh/ruff/). Config lives at `ruff.toml` (auto-discovered when ruff runs from this directory).
+
+```bash
+# One-time: install ruff into the project venv
+uv pip install --python /home/wychi/oss/wheels/.venv/bin/python ruff
+
+# Install the pre-commit hook (idempotent)
+bash gpumode/bioml/trimul/scripts/install-hooks.sh
+
+# Manual run
+ruff format work/*.py submission.py
+ruff check work/*.py submission.py
+```
+
+The pre-commit hook runs `ruff format --check` + `ruff check` on staged Python files under `gpumode/bioml/trimul/`. The auto-generated `work/hopper_gemm_ws.py` is excluded; the wrapper scripts under `work/` get a small allow-list (E402, F401, E501, F841) for legitimate setup-ordering and side-effect imports.
