@@ -1,0 +1,48 @@
+# TriMul (GPUMode Leaderboard)
+
+AlphaFold3 outgoing Triangle Multiplicative Update kernel. Forward pass only. Target: NVIDIA H100. Submission entrypoint is [`submission.py`](submission.py).
+
+## Layout
+
+```
+trimul/
+├── CLAUDE.md          ← this file (project index)
+├── AGENTS.md          ← popcorn-cli submission instructions (consumed by the agent harness)
+├── submission.py      ← reference implementation; kernel goes here
+├── references/        ← all design / analysis / planning docs
+│   ├── trimul_problem.md     ← problem spec, benchmark shapes, weights schema
+│   ├── fused_subgraphs.md    ← 3-subgraph decomposition + B+C-fusion plan
+│   └── gpu/                  ← per-GPU tailoring
+│       ├── README.md         ← cross-GPU summary, B+C-fusion verdict, open questions
+│       ├── a100.md           ← Ampere SM80
+│       ├── h100.md           ← Hopper SM90 (current target, profile-validated)
+│       ├── b200.md           ← Blackwell SM100
+│       └── mi300.md          ← AMD CDNA3 gfx942
+└── profile/           ← raw profiling artifacts (NCU report, MPP capture, wrappers)
+```
+
+## Where to start
+
+| Question | Read |
+|---|---|
+| What is TriMul, what shapes do we benchmark? | [`references/trimul_problem.md`](references/trimul_problem.md) |
+| How is the kernel decomposed into fusible regions? | [`references/fused_subgraphs.md`](references/fused_subgraphs.md) |
+| Which GPU am I targeting and what's the recipe? | [`references/gpu/README.md`](references/gpu/README.md) → per-GPU page |
+| What does the actual H100 kernel achieve today? | [`references/gpu/h100.md`](references/gpu/h100.md) → "Profiling Validation" |
+| Where are the raw profiling files? | [`profile/`](profile/) — `baseline.ncu-rep`, `ncu_full.csv`, `mpp_capture/` |
+| How do I submit? | [`AGENTS.md`](AGENTS.md) (popcorn-cli workflow) |
+
+## Status snapshot
+
+- **Reference impl** runs in pure PyTorch — current floor.
+- **H100 implementation** (`/home/wychi/oss/wheels/kernels/fb/hopper_gemm_ws.py`) measured end-to-end at **10.06 ms on the largest shape** (B=1, S=1024, D=384) — see `references/gpu/h100.md` → "End-to-End Measurements".
+  - Planning doc estimated 1.5–1.8 ms; real number is **6× higher**.
+  - **62% of wall time is precision tax**: bf16↔fp32 casts (40%) + fp32 cuBLAS einsum + final linear (21%). Author chose fp32 deliberately to handle cauchy-distributed inputs at S ≥ 512.
+- **All-bf16 design from the planning doc is unbuilt** — could plausibly hit ~3–4 ms (2.5× speedup) IF the accuracy gate (atol=2e-2 on cauchy shapes) survives without the fp32 promotions.
+- **A100/B200/MI300** estimates are planning-only, not measured. Likely 3–6× too low for the same reason. Treat as lower bounds.
+
+## Conventions
+
+- All shape numbers use `B = batch_size, S = seq_len, D = dim, H = hidden_dim`. `H = 128` always.
+- "Subgraph 1 / S1" = norm + 5 projections + gates; "Einsum" = `i k d, j k d → i j d`; "Subgraph 3 / S3" = norm + gate + final projection.
+- Cauchy distribution in 2/7 benchmark shapes ⇒ bf16 for inputs throughout, never fp8.
