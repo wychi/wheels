@@ -271,3 +271,23 @@ Geo-mean speedup across 7 shapes: **2.04×**. All shapes pass `atol=2e-2` agains
 - **What it would take to retry:** wheel rebuild fixing both `tl.split` codegen AND `tlx.local_slice` C++ binding. **Same wheel-level limit as iter21 (eviction_policy) and iter24 (local_slice).** Three independent iters in this campaign blocked by the same pybind/codegen surface.
 - **Time invested:** ~3 h (kernel design + 2 implementation passes + bench/standalone validation).
 
+### iter26 — Row-persistent CTA scheduler — **ABORT (matmul +50% slower; round-robin is at a local optimum)**
+
+- **Hypothesis (PLAN_v4 §4 iter26):** Round-robin scheduler `tile_id += NUM_SMS` re-fetches `pair` rows from DRAM (`num_pid_n=5` redundant prologue reads on shape 6). Row-persistent reuses each row in L2 across all `j` strips. Target +4–6% e2e on shape 6.
+- **Three variants tried** (nested `for pid_m: for pid_n`, flat `while`, `pid_n = (tile_id + sm_id) % num_pid_n` stagger). All recompiled and ran. None recovered baseline matmul throughput.
+- **Per-kernel attribution on shape 6 (torch.profiler, 10 iters):**
+
+  | Kernel | Baseline | iter26 | Δ |
+  |---|---|---|---|
+  | `matmul_kernel_tlx_ws` | 1125 µs | **1681 µs** | **+50%** |
+  | `fused_gate_ln_bmm_layout` | 1165 | 1147 | −1.5% |
+  | `ln_stats_and_bf16_cast` | 1101 | 1101 | 0% |
+  | `bmm_kernel_tlx_ws` | 691 | 691 | 0% |
+  | `fused_invtr_ln_gate` | 594 | 593 | 0% |
+
+- **Per-shape e2e (CUDA_VISIBLE_DEVICES=5):** 0=+1%, 1=0%, 2=+5%, 3=0%, 4=0%, 5=+10%, 6=+10%. The 50% matmul slowdown wholly explains the e2e regression — every downstream kernel is unchanged, so L2 state at the matmul boundary is irrelevant to the e2e win the plan predicted.
+- **Mechanism inference (unconfirmed):** row-persistent makes all 132 SMs lockstep through `pid_n=0..4` together, contending on the same B-column L2 sectors / HBM channels at every step. The original round-robin schedule naturally staggers SMs across both `pid_m` and `pid_n`. The `pid_n` stagger variant didn't help — suggests something deeper in the warp-spec pipeline (tail effects when SMs leave the persistent loop at very different times, or producer-consumer phase drift on contiguous tiles).
+- **T1:** 0/30 fail. T0 max_err 0.013, T1 max_err 0.029. Numerics byte-clean — kernel is functionally correct, just slower.
+- **Verdict:** ABORT. Reverted; only PROGRESS.md modified. **The round-robin scheduler is at a local optimum for this kernel; row-persistent is not a free L2-reuse win.**
+- **Time:** ~70 min of 90-min cap.
+

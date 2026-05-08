@@ -184,6 +184,12 @@ These can run concurrently because they target **different shape buckets** (D=12
 
 **Wheel-blocked surface (codified after the W1+W2 wipe):** Three independent iters (iter21, iter24, iter25) hit different pybind/codegen holes in the same uTLX wheel. Cumulative blocked features: `eviction_policy` on TMA loads, `local_alloc(layout=...)` user override, `tlx.local_slice` C++ binding, `tl.split` codegen on warp-spec acc layouts, multi-warpgroup conditional-barrier patterns (iter18 Phase A). Any future iter that depends on these features should first verify wheel support — likely abort criterion.
 
+- Row-persistent CTA scheduler for matmul_kernel_tlx_ws (iter26 — three variants tried, **matmul itself +50% slower** under any row-persistent pattern; per-kernel attribution shows the regression is entirely inside matmul. Best guess: 132 SMs lockstep on pid_n axis contending on the same B-column L2 sectors / HBM channels, while round-robin naturally staggers across both axes. The round-robin scheduler is at a local optimum for this kernel; the L2-reuse hypothesis was wrong. iter27 was conditional on this — also abandoned.)
+
+---
+
+**PLAN_v4 RESULT (2026-05-08):** 6/6 ABORT, 0% e2e change. Plan superseded by PLAN_v5.md.
+
 ---
 
 ## 6. Stop conditions
