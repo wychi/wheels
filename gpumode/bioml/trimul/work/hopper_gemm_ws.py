@@ -1631,10 +1631,32 @@ def tlx_ws_matmul_fixed(a, b, out_dtype=torch.bfloat16):
     triton.set_allocator(_alloc_fn)
     cfg = TLX_CONFIG
     num_tiles = triton.cdiv(M, cfg["BM"]) * triton.cdiv(N, cfg["BN"])
-    grid = (min(NUM_SMS, num_tiles),)
-    matmul_kernel_tlx_ws[grid](
-        a, b, c, M, N, K, NUM_SMS=NUM_SMS, num_stages=1, num_warps=4, **cfg
-    )
+    num_ctas = cfg["NUM_CTAS"]
+    if num_ctas == 2:
+        # Each cluster of 2 CTAs cooperates on one (M, N) output tile, with
+        # TMA multicast splitting the B-side load between them. Grid is in
+        # *cluster* units; the per-cluster stride in the kernel uses NUM_SMS
+        # which we set to the cluster count.
+        num_clusters = NUM_SMS // 2
+        grid = (min(num_clusters, num_tiles),)
+        matmul_kernel_tlx_ws[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            NUM_SMS=num_clusters,
+            num_stages=1,
+            num_warps=4,
+            num_ctas=2,
+            **cfg,
+        )
+    else:
+        grid = (min(NUM_SMS, num_tiles),)
+        matmul_kernel_tlx_ws[grid](
+            a, b, c, M, N, K, NUM_SMS=NUM_SMS, num_stages=1, num_warps=4, **cfg
+        )
     return c
 
 
