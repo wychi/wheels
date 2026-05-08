@@ -2436,44 +2436,19 @@ def tlx_ws_bmm_fp32(L, R):
 
 
 @triton.jit
-def ln_stats_multirow(
-    x_ptr,
-    mean_ptr,
-    rstd_ptr,
-    T,
-    dim: tl.constexpr,
-    eps: tl.constexpr,
-    BD: tl.constexpr,
-    BR: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    c = tl.arange(0, BD)
-    m = c < dim
-    for i in range(BR):
-        r = pid * BR + i
-        if r < T:
-            x = tl.load(x_ptr + r * dim + c, mask=m, other=0.0).to(tl.float32)
-            mu = tl.sum(x) / dim
-            xc = x - mu
-            tl.store(mean_ptr + r, mu)
-            tl.store(rstd_ptr + r, tl.rsqrt(tl.sum(xc * xc) / dim + eps))
-
-
-@triton.jit
-def ln_stats_and_bf16_cast(
+def ln_normalize_bf16(
     x_ptr,
     x_bf16_ptr,
-    mean_ptr,
-    rstd_ptr,
     T,
     dim: tl.constexpr,
     eps: tl.constexpr,
     BD: tl.constexpr,
     BR: tl.constexpr,
 ):
-    """One-pass over fp32 x: compute LN mean/rstd AND store bf16-cast x for
-    the downs_tream 5-projection matmul. Replaces ln_stats_multirow + a
-    separate fp32→bf16 elementwise cast (~0.4 GB write per call on shape 6)."""
+    """iter29: bf16-input variant of `ln_stats_and_bf16_cast`. Reads bf16 x,
+    computes LN mean/rstd inline (in fp32), writes `bf16((x - mu) * rstd)`
+    into a fresh buffer. Mean/rstd are not exported (see fold rationale on
+    `ln_stats_and_bf16_cast`)."""
     pid = tl.program_id(0)
     c = tl.arange(0, BD)
     m = c < dim
@@ -2484,9 +2459,45 @@ def ln_stats_and_bf16_cast(
             x = tl.load(x_ptr + base, mask=m, other=0.0).to(tl.float32)
             mu = tl.sum(x) / dim
             xc = x - mu
-            tl.store(mean_ptr + r, mu)
-            tl.store(rstd_ptr + r, tl.rsqrt(tl.sum(xc * xc) / dim + eps))
-            tl.store(x_bf16_ptr + base, x.to(tl.bfloat16), mask=m)
+            rstd = tl.rsqrt(tl.sum(xc * xc) / dim + eps)
+            tl.store(x_bf16_ptr + base, (xc * rstd).to(tl.bfloat16), mask=m)
+
+
+@triton.jit
+def ln_stats_and_bf16_cast(
+    x_ptr,
+    x_bf16_ptr,
+    T,
+    dim: tl.constexpr,
+    eps: tl.constexpr,
+    BD: tl.constexpr,
+    BR: tl.constexpr,
+):
+    """iter29: One-pass over fp32 x — compute LN mean/rstd inline AND store
+    bf16((x - mu) * rstd). Folds the LN-correction forward so the downstream
+    5-projection matmul produces `((x - mu) * rstd) @ B_g` directly and the
+    post-pass (`fused_gate_ln_bmm_layout`) only has to add the `s2` bias.
+
+    For cauchy distributions (shapes 1, 4) where x can be very large, the
+    normalized (x - mu) * rstd lives near unit scale — strictly more
+    bf16-friendly than casting raw x.
+
+    `mean`/`rstd` are NOT exported: nothing downstream needs them after the
+    fold (the post-bmm `fused_invtr_ln_gate*` kernels compute their own LN
+    over the `hd` axis).
+    """
+    pid = tl.program_id(0)
+    c = tl.arange(0, BD)
+    m = c < dim
+    for i in range(BR):
+        r = pid * BR + i
+        if r < T:
+            base = r * dim + c
+            x = tl.load(x_ptr + base, mask=m, other=0.0).to(tl.float32)
+            mu = tl.sum(x) / dim
+            xc = x - mu
+            rstd = tl.rsqrt(tl.sum(xc * xc) / dim + eps)
+            tl.store(x_bf16_ptr + base, (xc * rstd).to(tl.bfloat16), mask=m)
 
 
 @triton.jit
@@ -2560,16 +2571,19 @@ def fused_gate_ln_bmm_layout(
     L_ptr,
     R_ptr,
     og_ptr,
-    rstd_ptr,
-    mean_ptr,
-    s1_ptr,
     s2_ptr,
     B,
     N2,
     hd: tl.constexpr,
     TI: tl.constexpr,
 ):
-    """fused_gate_ln + write L, R directly in `[B*hd, N^2]` bmm-friendly layout.
+    """iter29: post-pass after the LN-correction fold.
+
+    With the prologue (`ln_stats_and_bf16_cast`) emitting `bf16((x-mu)*rstd)`,
+    the matmul produces `((x-mu)*rstd) @ B_g` directly. The full LN-affine
+    output is `proj + s2` (where `s2 = ln_b @ fat_w`), so this kernel just
+    biases proj by `s2` and applies sigmoid+mask+gate. The `rs * (... - mu*s1)`
+    chain (and the `rs`/`mu`/`s1` loads) are gone.
 
     Eliminates the [T, hd] lf/rf intermediate and the `tr_fwd_pair` kernel:
     we transpose in registers as we compute. Coalescing on the L/R writes is
@@ -2586,20 +2600,13 @@ def fused_gate_ln_bmm_layout(
     ij_ok = ij < N2
 
     t_off = pb * N2 + ij  # row indices into proj/mask/og of length T
-    # Affine tables (length 5*hd, layout: l, r, lg, rg, og)
-    s1_l = tl.load(s1_ptr + d)
+    # Bias tables (length 5*hd, layout: l, r, lg, rg, og)
     s2_l = tl.load(s2_ptr + d)
-    s1_r = tl.load(s1_ptr + d + hd)
     s2_r = tl.load(s2_ptr + d + hd)
-    s1_lg = tl.load(s1_ptr + d + 2 * hd)
     s2_lg = tl.load(s2_ptr + d + 2 * hd)
-    s1_rg = tl.load(s1_ptr + d + 3 * hd)
     s2_rg = tl.load(s2_ptr + d + 3 * hd)
-    s1_og = tl.load(s1_ptr + d + 4 * hd)
     s2_og = tl.load(s2_ptr + d + 4 * hd)
 
-    rs = tl.load(rstd_ptr + t_off, mask=ij_ok, other=0.0)[:, None]
-    mu = tl.load(mean_ptr + t_off, mask=ij_ok, other=0.0)[:, None]
     msk = tl.load(mask_ptr + t_off, mask=ij_ok, other=0.0)[:, None]
     base = t_off[:, None] * 5 * hd + d[None, :]
     p_mask = ij_ok[:, None]
@@ -2607,8 +2614,8 @@ def fused_gate_ln_bmm_layout(
     # Stage 1: lv * lg * m -> L[(b*hd + d), ij]
     lv_r = tl.load(proj_ptr + base, mask=p_mask).to(tl.float32)
     lg_r = tl.load(proj_ptr + base + 2 * hd, mask=p_mask).to(tl.float32)
-    lv = rs * (lv_r - mu * s1_l[None, :]) + s2_l[None, :]
-    lg = tl.sigmoid(rs * (lg_r - mu * s1_lg[None, :]) + s2_lg[None, :])
+    lv = lv_r + s2_l[None, :]
+    lg = tl.sigmoid(lg_r + s2_lg[None, :])
     L_tile = lv * lg * msk  # [TI, hd] fp32
     L_addr = (pb * hd + d[None, :]) * N2 + ij[:, None]
     tl.store(L_ptr + L_addr, L_tile, mask=p_mask)
@@ -2616,14 +2623,14 @@ def fused_gate_ln_bmm_layout(
     # Stage 2: rv * rg * m -> R[(b*hd + d), ij]
     rv_r = tl.load(proj_ptr + base + hd, mask=p_mask).to(tl.float32)
     rg_r = tl.load(proj_ptr + base + 3 * hd, mask=p_mask).to(tl.float32)
-    rv = rs * (rv_r - mu * s1_r[None, :]) + s2_r[None, :]
-    rg = tl.sigmoid(rs * (rg_r - mu * s1_rg[None, :]) + s2_rg[None, :])
+    rv = rv_r + s2_r[None, :]
+    rg = tl.sigmoid(rg_r + s2_rg[None, :])
     R_tile = rv * rg * msk
     tl.store(R_ptr + L_addr, R_tile, mask=p_mask)
 
     # Stage 3: og keeps the [T, hd] layout (fused_invtr_ln_gate consumes it that way)
     og_r = tl.load(proj_ptr + base + 4 * hd, mask=p_mask).to(tl.float32)
-    og_v = tl.sigmoid(rs * (og_r - mu * s1_og[None, :]) + s2_og[None, :])
+    og_v = tl.sigmoid(og_r + s2_og[None, :])
     og_addr = t_off[:, None] * hd + d[None, :]
     tl.store(og_ptr + og_addr, og_v, mask=p_mask)
 
@@ -2769,7 +2776,7 @@ def fused_invtr_ln_gate_proj(
 # Submission entry point
 # ---------------------------------------------------------------------------
 
-# Per-weights setup (B_g, s1, s2, w_out_bf16). We keep the most recent entry
+# Per-weights setup (B_g, s2, w_out_bf16). We keep the most recent entry
 # keyed by the W tensors' data_ptrs AND a small content fingerprint, since the
 # CUDA caching allocator reuses data_ptrs across calls — keying on ptrs alone
 # returns stale derived weights when a fresh W happens to land at the same
@@ -2832,7 +2839,9 @@ def _prep_weights(W, dim, hd):
     ).T.contiguous()
     fat_f = fat_w.float()
     B_g = (ln_w[:, None] * fat_f).to(torch.bfloat16).contiguous()
-    s1 = ln_w @ fat_f
+    # iter29: `s1 = ln_w @ fat_f` was consumed by `fused_gate_ln_bmm_layout`'s
+    # `mu * s1` term; the LN-correction fold makes that math go to zero, so
+    # s1 is no longer materialised.
     s2 = ln_b @ fat_f
     # iter13: for D=128 keep W["to_out.weight"] in fp32 — it's loaded inside
     # `fused_invtr_ln_gate_proj` and cast to bf16 ONLY at the tl.dot input
@@ -2843,7 +2852,7 @@ def _prep_weights(W, dim, hd):
         w_out = W["to_out.weight"].contiguous()  # fp32; cast inside kernel
     else:
         w_out = W["to_out.weight"].to(torch.bfloat16)
-    cached = (B_g, s1, s2, w_out)
+    cached = (B_g, s2, w_out)
     _W_CACHE[key] = cached
     return cached
 
@@ -2858,22 +2867,22 @@ def custom_kernel(data: input_t) -> output_t:
     x_flat = x_in.reshape(T, dim)
     BD = triton.next_power_of_2(dim)
 
-    mean = torch.empty(T, device=x_in.device, dtype=torch.float32)
-    rstd = torch.empty(T, device=x_in.device, dtype=torch.float32)
+    # iter29: fold LN-correction forward — emit `bf16((x - mu) * rstd)` so the
+    # downstream matmul produces `((x - mu) * rstd) @ B_g` directly. This drops
+    # the `mean`/`rstd` outputs (no consumer needed them after the fold), the
+    # `mu * s1` term inside `fused_gate_ln_bmm_layout`, and the `rs *` scale.
+    x_bf16 = torch.empty(T, dim, device=x_in.device, dtype=torch.bfloat16)
     if x_flat.dtype != torch.bfloat16:
-        # Fold the fp32→bf16 cast of x into the LN-stats pass — both touch the
-        # same [T, D] fp32 array; doing them together saves the second read.
-        x_bf16 = torch.empty(T, dim, device=x_in.device, dtype=torch.bfloat16)
         ln_stats_and_bf16_cast[(triton.cdiv(T, 4),)](
-            x_flat, x_bf16, mean, rstd, T, dim=dim, eps=1e-5, BD=BD, BR=4, num_warps=1
+            x_flat, x_bf16, T, dim=dim, eps=1e-5, BD=BD, BR=4, num_warps=1
         )
-        x_flat = x_bf16
     else:
-        ln_stats_multirow[(triton.cdiv(T, 4),)](
-            x_flat, mean, rstd, T, dim=dim, eps=1e-5, BD=BD, BR=4, num_warps=1
+        ln_normalize_bf16[(triton.cdiv(T, 4),)](
+            x_flat, x_bf16, T, dim=dim, eps=1e-5, BD=BD, BR=4, num_warps=1
         )
+    x_flat = x_bf16
 
-    B_g, s1, s2, w_out = _prep_weights(W, dim, hd)
+    B_g, s2, w_out = _prep_weights(W, dim, hd)
     proj = tlx_ws_matmul_fixed(x_flat, B_g, out_dtype=torch.bfloat16)
 
     mask_flat = mask.reshape(T).float()
@@ -2899,9 +2908,6 @@ def custom_kernel(data: input_t) -> output_t:
         L,
         R,
         out_gate,
-        rstd,
-        mean,
-        s1,
         s2,
         B,
         N2,
@@ -2909,7 +2915,7 @@ def custom_kernel(data: input_t) -> output_t:
         TI=TI_GL,
         num_warps=4,
     )
-    del proj, mean, rstd, s1, s2
+    del proj, s2
     L = L.view(B * hd, N, N)
     R = R.view(B * hd, N, N)
     # iter15: replace `torch.bmm(L, R.T).float()` with a single TLX warp-spec
