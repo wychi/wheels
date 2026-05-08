@@ -176,6 +176,9 @@ These can run concurrently because they target **different shape buckets** (D=12
 - CUDA Graph capture (PLAN_v3 iter19 — input-copy dominates for fresh-tensor calling convention).
 - Workspace pre-alloc as standalone iter (PLAN_v3 iter20 — CUDA caching allocator already optimal).
 - fp8 anywhere on cauchy shapes (precision budget too thin).
+- L2 cache-residency hints (`eviction_policy=`) on TMA descriptor loads (iter21 — uTLX C++ binding `create_async_tma_copy_global_to_local` has no slot for `EvictionPolicyAttr`; Python wrapper silently drops the kwarg. **Same class as C1**. Needs wheel rebuild.)
+- bmm B-side SMEM padding via `tlx.local_alloc(layout=...)` (iter22 — uTLX `local_alloc` always overwrites user `layout=` with `nv_mma_shared_layout_encoding.make_default`. Plus the plan's premise was wrong: NCU shows **0% LD bank conflict** on bmm; the real 56.8% conflict is on **STORES** of the fp32 acc → SMEM staging path, which needs an epilogue restructure, not a B-side pad.)
+- Standalone TLX final linear at K=128, N=384 (iter23 — kernel ~8% slower than cuBLAS standalone; K=128 too shallow to fill WGMMA pipe, N=384 forces num_pid_n=3, TMA forbids the asymmetric 192-wide tile cuBLAS picks. Only worth retrying if **fused** with additional epilogue work, e.g. via iter25.)
 
 ---
 

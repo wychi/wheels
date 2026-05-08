@@ -153,3 +153,51 @@ Geo-mean speedup across 7 shapes: **2.04×**. All shapes pass `atol=2e-2` agains
 - **Adversarial sweep**: not run (no candidate kernel to test).
 - **Time invested:** ~3 h of design + ~1 h of code attempts; reverted cleanly. Branch `trimul-iter18` retained for record but contains no kernel changes.
 
+### iter21 — L2 cache-residency hints on read-only TMA loads — **ABORT (wheel doesn't plumb hint)**
+
+- **Hypothesis (PLAN_v4 §4):** NCU shows L2 compression 0% across all kernels. Tag the read-only `B_g` (prepped weight), `pair`, and `mask` TMA descriptor loads with `eviction_policy="evict_last"` to pin them in L2 across persistent-CTA M-tile cycling. Target +3–8% e2e on shape 6.
+- **Wheel-API audit (utlx 0.1.0+gitcba4ef9a):**
+  - `tlx.async_descriptor_load` accepts `cache_modifier: str` and `eviction_policy: str` kwargs and validates them (`'', 'evict_first', 'evict_last'`), but **the body never passes either to the underlying `_semantic.builder.create_async_tma_copy_global_to_local` call**. Both kwargs are silently dropped.
+  - `tlx.async_descriptor_prefetch_tensor` shows the same pattern: it calls `_semantic._str_to_eviction_policy(eviction_policy)` and then **discards the result** before invoking `utlx_async_tma_prefetch`.
+  - The C++ binding `gluon_ir.GluonOpBuilder.create_async_tma_copy_global_to_local` is a 7-arg function (`desc, offsets, barrier, result, pred, multicast, multicast_targets`) with **no slot for an eviction-policy operand or attribute**. So even patching the Python wrapper would not get a hint into MLIR — the binding itself is missing the argument.
+  - `tlx.make_tensor_descriptor` has no cache/eviction kwargs either; its IR result is a bare `tt.tensordesc<…, #shared>` with no policy attribute.
+- **Empirical IR proof:** Added `eviction_policy="evict_last"` to the `b_desc` TMA load in `matmul_kernel_tlx_ws` and dumped MLIR with `MLIR_ENABLE_DUMP=1`. The resulting `ttng.async_tma_copy_global_to_local` op is byte-identical to baseline — zero `evict`-related substrings appear anywhere in the dumped TTGIR/TTIR. Reverted cleanly. Per-shape: 0=0.574 / 1=2.472 / 2=0.729 / 3=1.028 / 4=3.992 / 5=3.033 / 6=5.629 ms (kernel unchanged; numbers within noise of baseline).
+- **Verdict — ABORT** per PLAN_v4 §4 abort rule "cache-modifier syntax not supported by the wheel". Confirmed at three levels: (1) Python wrapper drops the kwarg, (2) C++ binding lacks the parameter, (3) empty MLIR diff. **Same class as C1** (uTLX wheel pybind hole).
+- **Unblocking work needed before retry:** wheel rebuild that (a) extends `create_async_tma_copy_global_to_local` to accept an `EvictionPolicyAttr` operand (the symbol `EvictionPolicyAttr` is already linked into `libutlx.so`), and (b) plumbs `cache_modifier` / `eviction_policy` through the `tlx.async_descriptor_load` Python wrapper to that new operand. Out of scope for in-tree iteration.
+- **Time invested:** ~25 min audit + 1 IR dump + revert. No commit needed.
+
+### iter22 — bmm SMEM bank-conflict pad — **ABORT (NCU disconfirms hypothesis; no in-scope lever)**
+
+- **PLAN_v4 hypothesis:** NCU shows 28% local bank conflict on bmm B-fragment **loads** from `tlx.local_trans` in `bmm_kernel_tlx_ws`. Pad LDS stride by 8 bf16 lanes OR force NVIDIA 128B swizzle on the B TMA descriptor. Estimated +1.5% e2e (~50 µs).
+- **NCU re-measurement (shape 6, kernel `bmm_kernel_tlx_ws`):**
+  - `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum` = **0** (loads have **zero** LSU bank conflicts; WGMMA reads B via `ldmatrix` through the tensor-memory pipe, not LSU)
+  - `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum` = 6,482,229 / 11,420,665 wavefronts = **56.8% on STORES** — fp32 accumulator → SMEM staging path for the TMA bulk store of `c` (`acc3d` shape `[1, 64, 128]` fp32 per consumer warpgroup).
+- **In-scope levers exhausted:**
+  1. **128B swizzle on B's TMA descriptor:** already on (`runner/tlx_patches.py` `_default_nvmma_swizzle` returns 128 because `block_shape[-1]*elem_bw = 64*16 = 128 B`). No higher swizzle exists.
+  2. **`pad_K=8` on B's `tlx.local_alloc`:** uTLX `local_alloc` (`utlx_plugin/mem_ops.py:104`) accepts `layout=` but **always overwrites** with `nv_mma_shared_layout_encoding.make_default(shape, dtype)` (line 148). User-supplied layout is dead code. Padding requires a runner-level patch.
+  3. **Eliminate `local_trans` by loading B in `[BK, BN]` via stride trick:** R is row-major `[batch, j, k]`; asking TMA for `[1, BK, BN]` indexes the wrong slice (not the transpose). Re-striding R changes the calling convention.
+- **Why the prescribed fix doesn't address measured conflicts:** the real cost is acc-fragment register-layout → SMEM swizzle mismatch on the C-store path. C TMA descriptor block_shape `[1, 64, 128]` fp32 already gets 128B swizzle; reshaping the BN tile (still all multiples of 32 fp32) keeps swizzle at 128B. Fixing this requires restructuring the consumer epilogue (e.g. column-strip stores), not the B operand.
+- **Decision:** ABORT with no kernel change. Recommended follow-ups: (a) "iter22b" runner patch enabling `local_alloc(..., layout=custom)` to target the C-store conflicts; (b) defer to iter25 (D=384 BM=64 decomposition), which restructures the consumer epilogue and incidentally narrows the C-store width.
+- **Time invested:** ~30 min NCU + source audit; no compile, no diff to `hopper_gemm_ws.py`.
+
+### iter23 — Custom TLX final linear (D=384, replace cuBLAS bf16) — **ABORT (kernel ~8% slower than cuBLAS standalone)**
+
+- **Hypothesis (PLAN_v4 §4 iter23):** cuBLAS bf16 final linear on shape 6 = ~0.55 ms (10% wall), runs sequentially after `fused_invtr_ln_gate` with no L2 reuse of `gated`. A custom TLX warp-spec GEMM reading `gated` straight from L2 should save the launch hop + L2 evict. Target ≥ 2% e2e on shape 6.
+- **Design:** `final_linear_kernel_tlx_ws` modeled on `bmm_kernel_tlx_ws` collapsed to 2D. bf16 [T, hd] @ bf16 [N=D, hd]^T → bf16 [T, D], fp32 accumulator (C6). Persistent warp-spec, replicate=2 consumers, `tlx.local_trans` on the B-side `[BN, BK]` slab. SMEM 98 KiB total.
+- **Standalone benchmark on shape 6 dims (M=1.05M, N=384, K=128):**
+
+  | Config | µs | vs cuBLAS |
+  |---|---|---|
+  | F.linear (cuBLAS bf16) | 549.6 | 1.000× |
+  | TLX BM=128 BN=128 NS=3 MG=2 GS=8 | 648.3 | 1.181× |
+  | TLX BM=128 BN=128 NS=3 MG=2 GS=1 | **594.4** | **1.083× (best)** |
+  | TLX BM=128 BN=128 NS=4 MG=2 GS=8 | 709.2 | 1.292× |
+  | TLX BM=256 BN=128 NS=3 MG=2 GS=1 | 641.3 | 1.168× |
+
+  All BN ∉ {128, 256} (e.g. 192, 384) failed compilation: TMA descriptor block widths must be powers of 2 for K=128. Best feasible config is **8% slower than cuBLAS** standalone.
+- **End-to-end with kernel wired in (best config GS=1):** shape 5 3.028 → 3.045 ms (+0.6%); shape 6 5.352 → 5.400 ms (+0.9%); other shapes unchanged (D=128 untouched).
+- **Why it loses:** This is a memory-bound shallow GEMM. K=128 → only 2 K-iters of BK=64, WGMMA pipeline never fills. N=384 → num_pid_n=3, too narrow for L2 grouping to amortize. cuBLAS uses an asymmetric tile (`nvjet_tst_192x192_64x4_*`, per iter15 NCU profile) tuned for this aspect ratio and is near the HBM floor (~330 µs at 3 TB/s vs 549 µs measured) — only ~220 µs of compute headroom before launch noise.
+- **Verdict (PLAN_v4 abort criterion):** ABORT — "standalone within 5% of cuBLAS — gain eaten by launch noise." Reverted dispatch site to `F.linear(gated, w_out)`. Numerics correct (T0 max_err 0.0147; T2 0/96 = 0.00%). Kernel definitions kept in iter23 worktree only; not merged.
+- **What might still work later:** any kernel that *fuses additional work* into the final linear (e.g., applying the to_out gate inside the matmul epilogue, or producing the [B, N, N, D] view directly) so the WGMMA pipeline isn't the bottleneck. iter25 (decomposed 2+2+1 fusion) may absorb this opportunity.
+- **Test infrastructure landed:** `check_leaderboard_seeds.py --tier T0|T1|T2|T3` (independently committed in main as `604287a`). Standalone bench/sweep helpers landed at `optimize/bench_final_linear.py` and `optimize/sweep_final_linear_cfg.py` for iter25 reuse.
+
