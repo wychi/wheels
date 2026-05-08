@@ -1868,7 +1868,9 @@ def custom_kernel(data: input_t) -> output_t:
     s1 = ln_w @ fat_f
     s2 = ln_b @ fat_f
     del fat_w, fat_f
-    proj = tlx_ws_matmul_fixed(x_flat, B_g, out_dtype=torch.bfloat16)
+    # cuBLAS bf16 GEMM (fp32 accum) — comparable to the WS TLX kernel for this
+    # shape and avoids the bespoke kernel's 1-CTA-per-SM limitation.
+    proj = torch.matmul(x_flat, B_g)
     del B_g
 
     mask_flat = mask.reshape(T).float()
@@ -1881,11 +1883,7 @@ def custom_kernel(data: input_t) -> output_t:
     del proj, mean, rstd, s1, s2
 
     # Transpose lf/rf into bmm-friendly [B*hd, N, N] bf16 (one kernel for both).
-    # Feed bf16 directly to cuBLAS — fp32 accumulator is used internally, and
-    # the bf16->fp32 cast we used to do doesn't restore mantissa bits already
-    # lost by the bf16 storage. Output is bf16 (cuBLAS doesn't expose mixed
-    # bf16-in / fp32-out via torch.bmm); fused_invtr_ln_gate's `.to(fp32)`
-    # reload still gives fp32 precision for the LN reduction.
+    # Feed bf16 to cuBLAS — fp32 accumulator internally; output is bf16.
     TILE_IJ = 128
     tr_grid = (B, triton.cdiv(N2, TILE_IJ))
     L = torch.empty(B * hd, N2, device=x_in.device, dtype=torch.bfloat16)

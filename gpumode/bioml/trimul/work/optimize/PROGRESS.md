@@ -13,6 +13,8 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 | 4 | O6 (partial): bf16 final linear (cuBLAS bf16 GEMM, fp32 accum) | 6.69 | **1.44×** | 14-24% per shape; cumulative 30.7% from baseline. Skip `gated.float()` upcast and `out.to(bf16)` downcast; cuBLAS uses fp32 accum internally |
 | 5 | O1: bf16 einsum bmm (cuBLAS bf16 GEMM, fp32 accum) | 5.82 | **1.66×** | 13-20% per shape; cumulative 39.7% from baseline. Skip the fp32 cast on L,R; tr_cast_fwd → tr_fwd_pair (no upcast). bmm output now bf16 (LN inside fused_invtr_ln_gate reloads as fp32). |
 | 6 | O10: fold fp32→bf16 cast of x into ln_stats (`ln_stats_and_bf16_cast`) | 5.12 | **1.89×** | 6-13% per shape; cumulative 47.0% from baseline. Saves second read of [T,D] fp32. |
+| 7a | strided fused_gate_ln write (skip tr_fwd_pair) — **REVERTED** | 8.08 | (-58%) | Uncoalesced strided write tanked everything. |
+| 7b | replace TLX matmul with cuBLAS bf16 GEMM | 5.12 | 1.89× | -3.6% on shape 0, 0% on shape 6; cuBLAS ≈ TLX WS for the 5-proj GEMM. |
 
 ## Per-iteration log
 
@@ -44,6 +46,10 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 - Cumulative: shape 6 9.66 → 6.69 ms = **1.44× faster than baseline**.
 - Profile delta on shape 6: fp32 cuBLAS H→D (sm90_xmma 64x256) at 0.95 ms — gone. bf16 cuBLAS replacement is in noise. `vectorized_elementwise` halved (was 2.14 → now 1.07 ms — the `gated.float()` and `out_fp32.to(bf16)` casts are gone).
 - Accuracy: max err on shape 0 0.0224→0.0254, shape 3 0.0201→0.0226 — still passes (`atol+rtol*|ref|` gate). All other shapes hold.
+
+### iter7 — strided fused_gate_ln write (REVERTED) + cuBLAS 5-proj matmul
+- **7a (reverted):** modify fused_gate_ln to write `lf, rf` directly in [B, hd, N²] (bmm-friendly) layout to skip the tr_fwd_pair pass. Within each program (1 thread block per row of length hd), the strided writes (offsets spaced N²=1M apart) destroyed coalescing and made every shape 50-60% slower. A correct fix would require 2D tiling (TI rows × hd cols per program), which is more invasive.
+- **7b:** replace `tlx_ws_matmul_fixed` with `torch.matmul(x_flat, B_g)` (cuBLAS bf16 GEMM, fp32 accum). Modest improvement on small shapes (shape 0 0.524→0.505, ≈3.6%), neutral on shape 6. Worth keeping for code simplicity — the 5-proj GEMM no longer relies on the bespoke TLX warp-spec kernel for any shape.
 
 ### iter6 — O10 (partial): fold fp32→bf16 cast of x into ln_stats
 - New Triton kernel `ln_stats_and_bf16_cast` reads fp32 x once, writes mean+rstd AND bf16-cast x. Replaces `ln_stats_multirow` + `x_flat.to(bf16)` elementwise pair.
