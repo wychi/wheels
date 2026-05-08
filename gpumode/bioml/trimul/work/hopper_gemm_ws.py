@@ -2214,22 +2214,27 @@ def fused_invtr_ln_gate_proj(
     t_off = pb * N2 + ij
     og_addr = t_off[:, None] * hd + d[None, :]
     og_val = tl.load(og_ptr + og_addr, mask=ij_ok[:, None]).to(tl.float32)
-    gated = (x_ln * og_val).to(tl.bfloat16)  # [TI, hd] bf16
+    # iter13: keep `gated` in fp32 — bf16 cast applied ONLY at the tl.dot input
+    # (mandatory for tensor cores), never earlier (silent precision loss). See
+    # accuracy/dtype_precision_debug.md Pattern 4 + LN exception.
+    gated = x_ln * og_val  # [TI, hd] fp32
 
     for pd in range(0, tl.cdiv(dim, BD)):
         do = pd * BD + tl.arange(0, BD)
         do_ok = do < dim
-        # W_out is [dim, hd] (PyTorch Linear weight). To compute gated @ W_out.T,
-        # load w[k, d] = W_out[do[d], k] and feed tl.dot.
+        # W_out is [dim, hd] fp32 (PyTorch Linear weight, kept fp32 in cache for
+        # D=128 — see _prep_weights). To compute gated @ W_out.T, load
+        # w[k, d] = W_out[do[d], k] and cast to bf16 ONLY at the tl.dot input.
         w = tl.load(
             w_out_ptr + do[None, :] * hd + d[:, None],
             mask=do_ok[None, :],
             other=0.0,
         )
-        out_acc = tl.dot(gated, w)  # [TI, BD] fp32 acc
+        out_acc = tl.dot(gated.to(tl.bfloat16), w.to(tl.bfloat16))  # [TI, BD] fp32 acc
         out_addr = t_off[:, None] * dim + do[None, :]
-        # Store fp32 directly — the leaderboard upcasts the result anyway, and
-        # holding precision here removes one bf16 round-trip in the cascade.
+        # iter13: store fp32 directly — no `.to(tl.bfloat16)` on the result.
+        # Removes one bf16 round-trip in the cascade and matches iter10b's
+        # fp32-output-buffer convention.
         tl.store(
             out_ptr + out_addr,
             out_acc,
@@ -2305,8 +2310,16 @@ def _prep_weights(W, dim, hd):
     B_g = (ln_w[:, None] * fat_f).to(torch.bfloat16).contiguous()
     s1 = ln_w @ fat_f
     s2 = ln_b @ fat_f
-    w_out_bf16 = W["to_out.weight"].to(torch.bfloat16)
-    cached = (B_g, s1, s2, w_out_bf16)
+    # iter13: for D=128 keep W["to_out.weight"] in fp32 — it's loaded inside
+    # `fused_invtr_ln_gate_proj` and cast to bf16 ONLY at the tl.dot input
+    # (precision rule per accuracy/dtype_precision_debug.md Pattern 4). For
+    # D=384 the cuBLAS bf16 path stays — fp32 cuBLAS falls back to CUDA cores
+    # (~15× slower) on the wider GEMM, and D=384 passes adversarial cleanly.
+    if dim == 128:
+        w_out = W["to_out.weight"].contiguous()  # fp32; cast inside kernel
+    else:
+        w_out = W["to_out.weight"].to(torch.bfloat16)
+    cached = (B_g, s1, s2, w_out)
     _W_CACHE[key] = cached
     return cached
 
@@ -2336,7 +2349,7 @@ def custom_kernel(data: input_t) -> output_t:
             x_flat, mean, rstd, T, dim=dim, eps=1e-5, BD=BD, BR=4, num_warps=1
         )
 
-    B_g, s1, s2, w_out_bf16 = _prep_weights(W, dim, hd)
+    B_g, s1, s2, w_out = _prep_weights(W, dim, hd)
     proj = tlx_ws_matmul_fixed(x_flat, B_g, out_dtype=torch.bfloat16)
 
     mask_flat = mask.reshape(T).float()
@@ -2376,11 +2389,35 @@ def custom_kernel(data: input_t) -> output_t:
     out_bmm = tlx_ws_bmm_fp32(L, R)
     del L, R
 
-    # cuBLAS bf16 GEMM for the final H→D linear in both D=128 and D=384 paths:
-    # the fused tl.dot variant (iter8) saves ~6% on D=128 but its precision
-    # margin against atol=2e-2 is too thin on adversarial weight draws (~2-4%
-    # of trials fail vs ~0.5% for the cuBLAS path).
     TI6 = 64
+    if dim == hd:
+        # iter13: D=128 fused path. `fused_invtr_ln_gate_proj` does inv-transpose
+        # + LN + gate-mul + (H→D) bf16 matmul in a single kernel, eliminating
+        # the [T, hd] gated intermediate (~0.27 GB on shape 4). With the iter13
+        # precision rules — fp32 output store, fp32 gated until tl.dot input —
+        # the adversarial-sweep margin should match or beat the cuBLAS path.
+        out = torch.empty(T, dim, device=x_in.device, dtype=torch.float32)
+        fused_invtr_ln_gate_proj[(B, triton.cdiv(N2, TI6))](
+            out_bmm.reshape(B * hd, N2),
+            out_gate,
+            W["to_out_norm.weight"],
+            W["to_out_norm.bias"],
+            w_out,  # fp32 [dim, hd] for D=128 (see _prep_weights)
+            out,
+            B,
+            N2,
+            hd=hd,
+            dim=dim,
+            eps=1e-5,
+            TI=TI6,
+            BD=triton.next_power_of_2(dim),
+            num_warps=4,
+        )
+        del out_bmm, out_gate
+        # iter13: return fp32 directly — the leaderboard verifier upcasts to
+        # fp32 anyway and this avoids one extra rounding step.
+        return out.view(B, N, N, dim)
+    # D=384: keep the two-kernel path (cuBLAS bf16 GEMM for the wider H→D).
     gated = torch.empty(T, hd, device=x_in.device, dtype=torch.bfloat16)
     fused_invtr_ln_gate[(B, triton.cdiv(N2, TI6))](
         out_bmm.reshape(B * hd, N2),
@@ -2396,7 +2433,7 @@ def custom_kernel(data: input_t) -> output_t:
         num_warps=4,
     )
     del out_bmm, out_gate
-    out_bf16 = F.linear(gated, w_out_bf16)
+    out_bf16 = F.linear(gated, w_out)
     return out_bf16.view(B, N, N, dim)
 
 
