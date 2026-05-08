@@ -1,0 +1,9 @@
+[runner] Triton 3.7.0
+[runner] uTLX loaded: /home/wychi/oss/wheels/.venv/lib/python3.13/site-packages/utlx_plugin/__init__.py
+[tlx_patches] applying semantic_shims
+[tlx_patches] applying dispatch_visit_with
+[tlx_patches] applying wgmma_use_acc_default
+[tlx_patches] applying broadcast_shape_overload
+[tlx_patches] applying gluon_op_builder_swap
+[tlx_patches] applying async_load_native
+[tlx_patches] applying warp_specialize_codegen

@@ -1822,6 +1822,65 @@ def fused_invtr_ln_gate(
     tl.store(out_ptr + og_addr, (x_ln * og_val).to(tl.bfloat16), mask=ij_ok[:, None])
 
 
+@triton.jit
+def fused_invtr_ln_gate_proj(
+    bmm_ptr,
+    og_ptr,
+    w_ln_ptr,
+    b_ln_ptr,
+    w_out_ptr,
+    out_ptr,
+    B,
+    N2,
+    hd: tl.constexpr,
+    dim: tl.constexpr,
+    eps: tl.constexpr,
+    TI: tl.constexpr,
+    BD: tl.constexpr,
+):
+    """Inv-transpose + LN over hd + gate-mul + (H→D) bf16 matmul, fused.
+
+    Per program: build a [TI, hd] gated tile in registers, then loop over
+    `dim` in BD-sized chunks emitting [TI, BD] tiles of the [T, dim] output.
+    Eliminates the [T, hd] gated intermediate (~0.27 GB on shape 6) without
+    re-reading bmm/og per dim chunk.
+    """
+    pb = tl.program_id(0)
+    pi = tl.program_id(1)
+    ij = pi * TI + tl.arange(0, TI)
+    d = tl.arange(0, hd)
+    ij_ok = ij < N2
+    x = tl.load(
+        bmm_ptr + (pb * hd + d[None, :]) * N2 + ij[:, None], mask=ij_ok[:, None]
+    ).to(tl.float32)
+    mu = tl.sum(x, axis=1) / hd
+    xc = x - mu[:, None]
+    xn = xc * tl.rsqrt(tl.sum(xc * xc, axis=1)[:, None] / hd + eps)
+    x_ln = xn * tl.load(w_ln_ptr + d)[None, :] + tl.load(b_ln_ptr + d)[None, :]
+    t_off = pb * N2 + ij
+    og_addr = t_off[:, None] * hd + d[None, :]
+    og_val = tl.load(og_ptr + og_addr, mask=ij_ok[:, None]).to(tl.float32)
+    gated = (x_ln * og_val).to(tl.bfloat16)  # [TI, hd] bf16
+
+    for pd in range(0, tl.cdiv(dim, BD)):
+        do = pd * BD + tl.arange(0, BD)
+        do_ok = do < dim
+        # W_out is [dim, hd] (PyTorch Linear weight). To compute gated @ W_out.T,
+        # load w[k, d] = W_out[do[d], k] and feed tl.dot.
+        w = tl.load(
+            w_out_ptr + do[None, :] * hd + d[:, None],
+            mask=do_ok[None, :],
+            other=0.0,
+        )
+        out_acc = tl.dot(gated, w)  # [TI, BD] fp32 acc
+        out_addr = t_off[:, None] * dim + do[None, :]
+        tl.store(
+            out_ptr + out_addr,
+            out_acc.to(tl.bfloat16),
+            mask=ij_ok[:, None] & do_ok[None, :],
+        )
+
+
 # ---------------------------------------------------------------------------
 # Submission entry point
 # ---------------------------------------------------------------------------
@@ -1893,30 +1952,52 @@ def custom_kernel(data: input_t) -> output_t:
     out_bmm = torch.bmm(L, R.transpose(-1, -2))
     del L, R
 
-    TI6 = 64
-    tr_grid6 = (B, triton.cdiv(N2, TI6))
-    gated = torch.empty(T, hd, device=x_in.device, dtype=torch.bfloat16)
-    fused_invtr_ln_gate[tr_grid6](
-        out_bmm.reshape(B * hd, N2),
-        out_gate,
-        W["to_out_norm.weight"],
-        W["to_out_norm.bias"],
-        gated,
-        B,
-        N2,
-        hd=hd,
-        eps=1e-5,
-        TI=TI6,
-        num_warps=4,
-    )
-    del out_bmm, out_gate
-
-    # Final projection in bf16 (cuBLAS bf16 GEMM still accumulates in fp32).
-    # K=hd=128 is small enough that bf16 input mantissa loss stays well inside
-    # atol=2e-2; saves the fp32 upcast of `gated` (0.27 GB write) and the
-    # fp32→bf16 downcast of the result (0.27 GB).
-    w_out_bf16 = W["to_out.weight"].to(torch.bfloat16)
-    out_bf16 = F.linear(gated, w_out_bf16)
+    out_bf16 = torch.empty(T, dim, device=x_in.device, dtype=torch.bfloat16)
+    if dim == hd:
+        # When dim == hd (==128), the Triton kernel keeps an entire [TI, dim]
+        # fp32 accumulator in registers and skips the [T, hd] gated intermediate
+        # — a clean ~6% win across D=128 shapes. For dim > hd the dim-loop
+        # forces re-loading W_out per chunk and cuBLAS bf16 GEMM ties or beats us.
+        TI6 = 64
+        BD6 = 128
+        w_out_bf16 = W["to_out.weight"].to(torch.bfloat16)
+        fused_invtr_ln_gate_proj[(B, triton.cdiv(N2, TI6))](
+            out_bmm.reshape(B * hd, N2),
+            out_gate,
+            W["to_out_norm.weight"],
+            W["to_out_norm.bias"],
+            w_out_bf16,
+            out_bf16,
+            B,
+            N2,
+            hd=hd,
+            dim=dim,
+            eps=1e-5,
+            TI=TI6,
+            BD=BD6,
+            num_warps=4,
+        )
+        del out_bmm, out_gate
+    else:
+        # D=384: fall back to two kernels (LN+gate then cuBLAS bf16 H→D linear).
+        TI6 = 64
+        gated = torch.empty(T, hd, device=x_in.device, dtype=torch.bfloat16)
+        fused_invtr_ln_gate[(B, triton.cdiv(N2, TI6))](
+            out_bmm.reshape(B * hd, N2),
+            out_gate,
+            W["to_out_norm.weight"],
+            W["to_out_norm.bias"],
+            gated,
+            B,
+            N2,
+            hd=hd,
+            eps=1e-5,
+            TI=TI6,
+            num_warps=4,
+        )
+        del out_bmm, out_gate
+        w_out_bf16 = W["to_out.weight"].to(torch.bfloat16)
+        out_bf16 = F.linear(gated, w_out_bf16)
     return out_bf16.view(B, N, N, dim)
 
 

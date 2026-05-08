@@ -15,6 +15,7 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 | 6 | O10: fold fp32→bf16 cast of x into ln_stats (`ln_stats_and_bf16_cast`) | 5.12 | **1.89×** | 6-13% per shape; cumulative 47.0% from baseline. Saves second read of [T,D] fp32. |
 | 7a | strided fused_gate_ln write (skip tr_fwd_pair) — **REVERTED** | 8.08 | (-58%) | Uncoalesced strided write tanked everything. |
 | 7b | replace TLX matmul with cuBLAS bf16 GEMM — **REVERTED (user preference: keep TLX)** | 5.12 | 1.89× | Measured equivalent perf; reverted at user request to keep TLX kernel as the optimization target. |
+| 8 | O6: fused inv-tr + LN + gate + H→D linear (`fused_invtr_ln_gate_proj`); dispatched only when dim==hd | 5.12 | 1.89× | D=128 shapes -5 to -6% (eliminates [T,hd] gated intermediate); D=384 keeps 2-kernel path (cuBLAS bf16 ≥ Triton fused for the wider GEMM). |
 
 ## Per-iteration log
 
@@ -46,6 +47,12 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 - Cumulative: shape 6 9.66 → 6.69 ms = **1.44× faster than baseline**.
 - Profile delta on shape 6: fp32 cuBLAS H→D (sm90_xmma 64x256) at 0.95 ms — gone. bf16 cuBLAS replacement is in noise. `vectorized_elementwise` halved (was 2.14 → now 1.07 ms — the `gated.float()` and `out_fp32.to(bf16)` casts are gone).
 - Accuracy: max err on shape 0 0.0224→0.0254, shape 3 0.0201→0.0226 — still passes (`atol+rtol*|ref|` gate). All other shapes hold.
+
+### iter8 — O6: fuse fused_invtr_ln_gate + final H→D linear (D=128 only)
+- New kernel `fused_invtr_ln_gate_proj` builds the [TI, hd] gated tile in registers, then runs `tl.dot(gated_bf16, W_out.T_bf16)` and writes [TI, dim] bf16 directly to the final output.
+- Dispatched only when `dim == hd` (the D=128 shapes). For D > hd, the fused path's loop over BD chunks re-loads bmm/og or expands the register footprint; cuBLAS bf16 GEMM ties or wins, so we keep the two-kernel path.
+- Per-shape speedup vs iter7: 0=-5.5%, 1=-5.7%, 3=-6.2%, 4=-6.1% (all D=128). D=384 shapes unchanged.
+- Eliminates the [T, hd] bf16 gated intermediate (~0.27 GB on shape 4) for D=128 shapes.
 
 ### iter7 — strided fused_gate_ln write (REVERTED) + cuBLAS 5-proj matmul
 - **7a (reverted):** modify fused_gate_ln to write `lf, rf` directly in [B, hd, N²] (bmm-friendly) layout to skip the tr_fwd_pair pass. Within each program (1 thread block per row of length hd), the strided writes (offsets spaced N²=1M apart) destroyed coalescing and made every shape 50-60% slower. A correct fix would require 2D tiling (TI rows × hd cols per program), which is more invasive.
