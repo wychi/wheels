@@ -1784,6 +1784,81 @@ def fused_gate_ln(
 
 
 @triton.jit
+def fused_gate_ln_bmm_layout(
+    proj_ptr,
+    mask_ptr,
+    L_ptr,
+    R_ptr,
+    og_ptr,
+    rstd_ptr,
+    mean_ptr,
+    s1_ptr,
+    s2_ptr,
+    B,
+    N2,
+    hd: tl.constexpr,
+    TI: tl.constexpr,
+):
+    """fused_gate_ln + write L, R directly in `[B*hd, N^2]` bmm-friendly layout.
+
+    Eliminates the [T, hd] lf/rf intermediate and the `tr_fwd_pair` kernel:
+    we transpose in registers as we compute. Coalescing on the L/R writes is
+    natural — 32 lanes hit 32 contiguous ij addresses for each d row.
+
+    Grid: (B, cdiv(N^2, TI)).  Per program processes one batch and TI ij
+    positions, computing tiles of shape [TI, hd] then transposing to [hd, TI]
+    on store. og keeps the [T, hd] layout (consumed by fused_invtr_ln_gate).
+    """
+    pb = tl.program_id(0)
+    pi = tl.program_id(1)
+    ij = pi * TI + tl.arange(0, TI)
+    d = tl.arange(0, hd)
+    ij_ok = ij < N2
+
+    t_off = pb * N2 + ij  # row indices into proj/mask/og of length T
+    # Affine tables (length 5*hd, layout: l, r, lg, rg, og)
+    s1_l = tl.load(s1_ptr + d)
+    s2_l = tl.load(s2_ptr + d)
+    s1_r = tl.load(s1_ptr + d + hd)
+    s2_r = tl.load(s2_ptr + d + hd)
+    s1_lg = tl.load(s1_ptr + d + 2 * hd)
+    s2_lg = tl.load(s2_ptr + d + 2 * hd)
+    s1_rg = tl.load(s1_ptr + d + 3 * hd)
+    s2_rg = tl.load(s2_ptr + d + 3 * hd)
+    s1_og = tl.load(s1_ptr + d + 4 * hd)
+    s2_og = tl.load(s2_ptr + d + 4 * hd)
+
+    rs = tl.load(rstd_ptr + t_off, mask=ij_ok, other=0.0)[:, None]
+    mu = tl.load(mean_ptr + t_off, mask=ij_ok, other=0.0)[:, None]
+    msk = tl.load(mask_ptr + t_off, mask=ij_ok, other=0.0)[:, None]
+    base = t_off[:, None] * 5 * hd + d[None, :]
+    p_mask = ij_ok[:, None]
+
+    # Stage 1: lv * lg * m -> L[(b*hd + d), ij]
+    lv_r = tl.load(proj_ptr + base, mask=p_mask).to(tl.float32)
+    lg_r = tl.load(proj_ptr + base + 2 * hd, mask=p_mask).to(tl.float32)
+    lv = rs * (lv_r - mu * s1_l[None, :]) + s2_l[None, :]
+    lg = tl.sigmoid(rs * (lg_r - mu * s1_lg[None, :]) + s2_lg[None, :])
+    L_tile = lv * lg * msk  # [TI, hd] fp32
+    L_addr = (pb * hd + d[None, :]) * N2 + ij[:, None]
+    tl.store(L_ptr + L_addr, L_tile, mask=p_mask)
+
+    # Stage 2: rv * rg * m -> R[(b*hd + d), ij]
+    rv_r = tl.load(proj_ptr + base + hd, mask=p_mask).to(tl.float32)
+    rg_r = tl.load(proj_ptr + base + 3 * hd, mask=p_mask).to(tl.float32)
+    rv = rs * (rv_r - mu * s1_r[None, :]) + s2_r[None, :]
+    rg = tl.sigmoid(rs * (rg_r - mu * s1_rg[None, :]) + s2_rg[None, :])
+    R_tile = rv * rg * msk
+    tl.store(R_ptr + L_addr, R_tile, mask=p_mask)
+
+    # Stage 3: og keeps the [T, hd] layout (fused_invtr_ln_gate consumes it that way)
+    og_r = tl.load(proj_ptr + base + 4 * hd, mask=p_mask).to(tl.float32)
+    og_v = tl.sigmoid(rs * (og_r - mu * s1_og[None, :]) + s2_og[None, :])
+    og_addr = t_off[:, None] * hd + d[None, :]
+    tl.store(og_ptr + og_addr, og_v, mask=p_mask)
+
+
+@triton.jit
 def tr_fwd(src, dst, B, N2, hd: tl.constexpr, TI: tl.constexpr):
     pb = tl.program_id(0)
     pi = tl.program_id(1)
@@ -2018,38 +2093,32 @@ def custom_kernel(data: input_t) -> output_t:
     proj = tlx_ws_matmul_fixed(x_flat, B_g, out_dtype=torch.bfloat16)
 
     mask_flat = mask.reshape(T).float()
-    lf = torch.empty(T, hd, device=x_in.device, dtype=torch.bfloat16)
-    rf = torch.empty(T, hd, device=x_in.device, dtype=torch.bfloat16)
-    # out_gate as fp32 — it feeds the final gate-mul in `fused_invtr_ln_gate*`,
-    # where we cast to fp32 anyway. Storing fp32 here removes one bf16 round
-    # in the precision cascade (~0.27 GB extra write/read on shape 6).
+    # Allocate L, R directly in bmm-friendly [B*hd, N^2] bf16 layout. The new
+    # `fused_gate_ln_bmm_layout` kernel does the LN/gate math AND transposes on
+    # the way out — eliminates the [T, hd] lf/rf intermediate and the
+    # `tr_fwd_pair` pass (~0.5 ms + 0.54 GB on shape 6).
+    # out_gate is fp32 to preserve the cascade margin (see iter10b postmortem).
+    L = torch.empty(B * hd, N2, device=x_in.device, dtype=torch.bfloat16)
+    R = torch.empty(B * hd, N2, device=x_in.device, dtype=torch.bfloat16)
     out_gate = torch.empty(T, hd, device=x_in.device, dtype=torch.float32)
-    BR_GL = 4
-    fused_gate_ln[(triton.cdiv(T, BR_GL),)](
+    TI_GL = 64
+    fused_gate_ln_bmm_layout[(B, triton.cdiv(N2, TI_GL))](
         proj,
         mask_flat,
-        lf,
-        rf,
+        L,
+        R,
         out_gate,
         rstd,
         mean,
         s1,
         s2,
-        T,
+        B,
+        N2,
         hd=hd,
-        BR=BR_GL,
+        TI=TI_GL,
         num_warps=4,
     )
     del proj, mean, rstd, s1, s2
-
-    # Transpose lf/rf into bmm-friendly [B*hd, N, N] bf16 (one kernel for both).
-    # Feed bf16 to cuBLAS — fp32 accumulator internally; output is bf16.
-    TILE_IJ = 128
-    tr_grid = (B, triton.cdiv(N2, TILE_IJ))
-    L = torch.empty(B * hd, N2, device=x_in.device, dtype=torch.bfloat16)
-    R = torch.empty(B * hd, N2, device=x_in.device, dtype=torch.bfloat16)
-    tr_fwd_pair[tr_grid](lf, rf, L, R, B, N2, hd=hd, TI=TILE_IJ, num_warps=4)
-    del lf, rf
     L = L.view(B * hd, N, N)
     R = R.view(B * hd, N, N)
     # Promote bmm output to fp32 to avoid the third bf16 round-trip in the
