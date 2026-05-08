@@ -1736,7 +1736,7 @@ def tr_fwd(src, dst, B, N2, hd: tl.constexpr, TI: tl.constexpr):
 
 
 @triton.jit
-def tr_cast_fwd(
+def tr_fwd_pair(
     src_l_ptr,
     src_r_ptr,
     dst_l_ptr,
@@ -1746,9 +1746,8 @@ def tr_cast_fwd(
     hd: tl.constexpr,
     TI: tl.constexpr,
 ):
-    """Fused transpose + bf16->fp32 upcast for both L and R operands of the
-    einsum bmm. One kernel launch replaces 2× tr_fwd + 2× elementwise upcast,
-    cutting the [B*hd, N²] bf16 intermediate."""
+    """Transpose both bmm operands (no dtype change). One kernel launch
+    replaces 2× tr_fwd (and primes both L/R caches at the same time)."""
     pb = tl.program_id(0)
     pi = tl.program_id(1)
     ij = pi * TI + tl.arange(0, TI)
@@ -1756,8 +1755,8 @@ def tr_cast_fwd(
     m = ij[:, None] < N2
     src_off = (pb * N2 + ij[:, None]) * hd + d[None, :]
     dst_off = (pb * hd + d[None, :]) * N2 + ij[:, None]
-    lv = tl.load(src_l_ptr + src_off, mask=m).to(tl.float32)
-    rv = tl.load(src_r_ptr + src_off, mask=m).to(tl.float32)
+    lv = tl.load(src_l_ptr + src_off, mask=m)
+    rv = tl.load(src_r_ptr + src_off, mask=m)
     tl.store(dst_l_ptr + dst_off, lv, mask=m)
     tl.store(dst_r_ptr + dst_off, rv, mask=m)
 
@@ -1844,23 +1843,22 @@ def custom_kernel(data: input_t) -> output_t:
     )
     del proj, mean, rstd, s1, s2
 
-    # Fused transpose + bf16->fp32 upcast — one kernel launch produces the
-    # fp32 [B*hd, N, N] bmm operands directly, replacing 2× tr_fwd (bf16 copy)
-    # plus 2× elementwise upcast. Saves the [B*hd, N²] bf16 intermediate
-    # (≈0.54 GB) and a kernel launch.
+    # Transpose lf/rf into bmm-friendly [B*hd, N, N] bf16 (one kernel for both).
+    # Feed bf16 directly to cuBLAS — fp32 accumulator is used internally, and
+    # the bf16->fp32 cast we used to do doesn't restore mantissa bits already
+    # lost by the bf16 storage. Output is bf16 (cuBLAS doesn't expose mixed
+    # bf16-in / fp32-out via torch.bmm); fused_invtr_ln_gate's `.to(fp32)`
+    # reload still gives fp32 precision for the LN reduction.
     TILE_IJ = 128
     tr_grid = (B, triton.cdiv(N2, TILE_IJ))
-    Lf = torch.empty(B * hd, N2, device=x_in.device, dtype=torch.float32)
-    Rf = torch.empty(B * hd, N2, device=x_in.device, dtype=torch.float32)
-    tr_cast_fwd[tr_grid](lf, rf, Lf, Rf, B, N2, hd=hd, TI=TILE_IJ, num_warps=4)
+    L = torch.empty(B * hd, N2, device=x_in.device, dtype=torch.bfloat16)
+    R = torch.empty(B * hd, N2, device=x_in.device, dtype=torch.bfloat16)
+    tr_fwd_pair[tr_grid](lf, rf, L, R, B, N2, hd=hd, TI=TILE_IJ, num_warps=4)
     del lf, rf
-    Lf = Lf.view(B * hd, N, N)
-    Rf = Rf.view(B * hd, N, N)
-    # bf16 bmm over K=seq_len accumulates ~sqrt(K)*0.4% relative error, which
-    # exceeds atol=2e-2 for sl ≥ 512 with cauchy-tailed values; keep fp32 via
-    # cuBLAS TF32. fused_invtr_ln_gate consumes the fp32 result directly.
-    out_bmm = torch.bmm(Lf, Rf.transpose(-1, -2))
-    del Lf, Rf
+    L = L.view(B * hd, N, N)
+    R = R.view(B * hd, N, N)
+    out_bmm = torch.bmm(L, R.transpose(-1, -2))
+    del L, R
 
     TI6 = 64
     tr_grid6 = (B, triton.cdiv(N2, TI6))

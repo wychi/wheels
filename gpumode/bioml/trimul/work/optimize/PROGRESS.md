@@ -11,6 +11,7 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 | 2 | O2: thin-K matmul cfg for D=128 — **REVERTED** | 9.39 | (no-op) | matmul on shape 4 went 922→928 us (slightly worse); D=128 shapes already reach steady state |
 | 3 | O4: fused tr+cast (`tr_cast_fwd`) for bmm operands | 8.78 | **1.10×** | 6-10% across all shapes; replaces 2× tr_fwd + 2× elementwise upcast with one kernel; bf16 [B*hd,N²] intermediate eliminated |
 | 4 | O6 (partial): bf16 final linear (cuBLAS bf16 GEMM, fp32 accum) | 6.69 | **1.44×** | 14-24% per shape; cumulative 30.7% from baseline. Skip `gated.float()` upcast and `out.to(bf16)` downcast; cuBLAS uses fp32 accum internally |
+| 5 | O1: bf16 einsum bmm (cuBLAS bf16 GEMM, fp32 accum) | 5.82 | **1.66×** | 13-20% per shape; cumulative 39.7% from baseline. Skip the fp32 cast on L,R; tr_cast_fwd → tr_fwd_pair (no upcast). bmm output now bf16 (LN inside fused_invtr_ln_gate reloads as fp32). |
 
 ## Per-iteration log
 
@@ -42,6 +43,15 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 - Cumulative: shape 6 9.66 → 6.69 ms = **1.44× faster than baseline**.
 - Profile delta on shape 6: fp32 cuBLAS H→D (sm90_xmma 64x256) at 0.95 ms — gone. bf16 cuBLAS replacement is in noise. `vectorized_elementwise` halved (was 2.14 → now 1.07 ms — the `gated.float()` and `out_fp32.to(bf16)` casts are gone).
 - Accuracy: max err on shape 0 0.0224→0.0254, shape 3 0.0201→0.0226 — still passes (`atol+rtol*|ref|` gate). All other shapes hold.
+
+### iter5 — O1: bf16 einsum bmm (Codex's "no precision restoration" insight)
+- Drop the bf16→fp32 upcast in `tr_cast_fwd` → renamed `tr_fwd_pair` (just transpose). Run `torch.bmm` on bf16 inputs; cuBLAS uses fp32 accumulator internally. Output is bf16 (cuBLAS lacks bf16-in/fp32-out via `torch.bmm`).
+- The bf16→fp32 upcast we'd been doing didn't restore mantissa bits the bf16 storage already lost; per Codex's analysis, the multiply input precision is identical to bf16 input + fp32 accum.
+- Per-shape speedup: 0=19.9%, 1=17.9%, 2=12.6%, 3=16.1%, 4=17.7%, 5=13.5%, 6=13.0%.
+- Cumulative shape 6: 6.69 → 5.82 ms = **1.66× faster than baseline**.
+- Profile delta on shape 6: tr_cast_fwd 0.79 ms → tr_fwd_pair 0.51 ms (-0.28); fp32 cuBLAS einsum 1.10 ms → bf16 cuBLAS einsum is no longer in the top 9 (sub-0.5 ms); fused_invtr_ln_gate 0.47 → 0.36 ms (reads bf16 instead of fp32).
+- Accuracy: cauchy shape 1 max_err 0.0192→0.0217, shape 4 0.0187→0.0205 — still passes the `atol+rtol*|ref|` gate. Tighter than feared.
+
 
 
 

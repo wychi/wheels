@@ -1,0 +1,9 @@
+# Per-kernel breakdown — shape 6: {'bs': 1, 'dim': 384, 'distribution': 'normal', 'hiddendim': 128, 'nomask': True, 'seqlen': 1024}
+                                   matmul_kernel_tlx_ws         0.00%       0.000us         0.00%       0.000us       0.000us      22.928ms        19.78%      22.928ms       1.146ms            20  
+void at::native::vectorized_elementwise_kernel<8, at...         0.00%       0.000us         0.00%       0.000us       0.000us      21.361ms        18.43%      21.361ms     356.016us            60  
+                                          fused_gate_ln         0.00%       0.000us         0.00%       0.000us       0.000us      19.326ms        16.67%      19.326ms     966.308us            20  
+                                      ln_stats_multirow         0.00%       0.000us         0.00%       0.000us       0.000us      14.600ms        12.60%      14.600ms     730.023us            20  
+                                            tr_fwd_pair         0.00%       0.000us         0.00%       0.000us       0.000us      10.105ms         8.72%      10.105ms     505.230us            20  
+                                    fused_invtr_ln_gate         0.00%       0.000us         0.00%       0.000us       0.000us       7.285ms         6.28%       7.285ms     364.233us            20  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us      66.494us         0.06%      66.494us       3.325us            20  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us      50.048us         0.04%      50.048us       2.502us            20  
