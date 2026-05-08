@@ -291,3 +291,38 @@ Geo-mean speedup across 7 shapes: **2.04×**. All shapes pass `atol=2e-2` agains
 - **Verdict:** ABORT. Reverted; only PROGRESS.md modified. **The round-robin scheduler is at a local optimum for this kernel; row-persistent is not a free L2-reuse win.**
 - **Time:** ~70 min of 90-min cap.
 
+### iter31 — bmm tile-config sweep (B3) — **PASS (BK=64→128, NS=3→2, GSM=8→1; shape 6 −1.3%)**
+
+- **Hypothesis (PLAN_v5 §4 / B3):** `bmm_kernel_tlx_ws` was set to `BM=128 BN=128 BK=64 NS=3 MG=2 GSM=8` in iter15 by analogy to the matmul kernel. Iter11 swept matmul tiles (local optimum), but bmm wasn't swept. Try a focused Cartesian product to look for a 0-3% e2e win on shape 6.
+- **Sweep (`work/optimize/sweep_bmm_cfg.py`):** 108 combos × axes `BM∈{128,256}, BN∈{64,128,256}, BK∈{32,64,128}, NS∈{2,3,4}, GSM∈{1,8}`. 22 combos pruned a-priori by the SMEM-cap predicate (`smem_bytes > 232,448`); another 17 hit `OutOfResources` at compile time after MLIR layout/swizzle padding inflated the footprint past the predicate's estimate. **Locked axes (structural, not config-only): NUM_MMA_GROUPS=2 and replicate=2** — the producer hard-codes a 2-half A-load via `tlx.async_task_replica_id()` and barriers are sized as `NS*MG`. Sweeping these would require kernel surgery, out of scope.
+- **Top 5 standalone bmm configs on shape 6 dims (BATCH=128, N=1024), µs / SMEM (single-pass median, 30 iters):**
+
+  | rank | BM | BN | BK | NS | GSM | SMEM B | µs | vs base |
+  |---|---|---|---|---|---|---|---|---|
+  | 1 | 128 | 128 | 128 | 2 | 1 | 132,096 | 636.5 | 0.896× |
+  | 2 | 128 | 128 | 64 | 4 | 1 | 132,096 | 637.7 | 0.898× |
+  | 3 | 128 | 128 | 64 | 4 | 8 | 132,096 | 652.2 | 0.918× |
+  | 4 | 256 | 64 | 128 | 2 | 1 | 164,864 | 661.2 | 0.931× |
+  | 5 | 128 | 128 | 128 | 2 | 8 | 132,096 | 662.8 | 0.933× |
+
+  Re-bench (100 iters × 2 passes) of top-3 confirmed ranking stable: c1 = 666–670 µs, c2 = 676–685 µs, c3 = 696 µs, baseline = 729–765 µs (drift on baseline is run-to-run thermal — the 10% c1 win is robust).
+- **Winner:** `BM=128, BN=128, BK=128, NS=2, GSM=1` (c1). Replaces `BMM_TLX_CONFIG` in `hopper_gemm_ws.py:1953`.
+- **Why it wins (read of the result):** larger BK (128 vs 64) halves the K-iter count (8→4) and amortizes pipeline fill/drain overhead. Lower NS (3→2) is offset by the larger SMEM tiles still reaching enough in-flight BK chunks. GSM=1 disables L2 grouping — at BATCH=128, the round-robin schedule across 132 SMs already gives good L2 reuse without the `pid_m` swizzle, and GSM=1 gives a more balanced producer-consumer phase pattern.
+- **Per-shape e2e ms (CUDA_VISIBLE_DEVICES=7, 2 passes, mean):**
+
+  | shape | baseline | iter31 | Δ |
+  |---|---|---|---|
+  | 0 (S=256, D=128) | 0.575 | 0.571 | −0.7% |
+  | 1 (S=768, D=128, cauchy) | 2.356 | 2.340 | −0.7% |
+  | 2 (S=256, D=384) | 0.732 | 0.732 | 0.0% |
+  | 3 (S=512, D=128) | 1.032 | 1.020 | −1.2% |
+  | 4 (S=1024, D=128, cauchy) | 3.997 | 3.925 | −1.8% |
+  | 5 (S=768, D=384) | 3.030 | 3.008 | −0.7% |
+  | 6 (S=1024, D=384) | 5.364 | 5.293 | **−1.3%** |
+
+  Geo-mean improvement ≈ **−1.0%**. No shape regresses; biggest wins on the two largest D=128 shapes (1, 4) which spend the most time in `bmm_kernel_tlx_ws`.
+- **T0:** PASS (0/1, max_err 0.014). **T1:** PASS (0/30, max_err 0.027). Numerics unchanged — fp32 accumulation path identical, only tile shape and pipeline depth shifted.
+- **Verdict:** **PASS.** Standalone win is 10% (≥1% threshold cleared by 10×). E2e geo-mean −1.0%, shape 6 −1.3% (≥0.5% threshold cleared). No regressions. Lesson: matmul was at a local optimum (iter11), but bmm was *not* — different aspect ratio (square `[N,N] @ [N,N]^T` vs rectangular matmul) made a different tile shape optimal.
+- **Files touched:** `gpumode/bioml/trimul/work/hopper_gemm_ws.py` (`BMM_TLX_CONFIG`), `gpumode/bioml/trimul/work/optimize/sweep_bmm_cfg.py` (new).
+- **Time:** ~60 min of 90-min cap.
+

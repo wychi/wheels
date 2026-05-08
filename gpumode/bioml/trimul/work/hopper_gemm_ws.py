@@ -1952,11 +1952,17 @@ def bmm_kernel_tlx_ws(
 BMM_TLX_CONFIG = dict(
     BM=128,
     BN=128,
-    BK=64,
-    GROUP_SIZE_M=8,
-    NUM_STAGES=3,
+    BK=128,
+    GROUP_SIZE_M=1,
+    NUM_STAGES=2,
     NUM_MMA_GROUPS=2,
 )
+# iter31: tile-config sweep on shape 6 (BATCH=128, N=1024). Prior config
+# (BK=64, NS=3, GSM=8) was set in iter15 by analogy to the matmul kernel.
+# Sweeping 86 configs (work/optimize/sweep_bmm_cfg.py) found
+# (BK=128, NS=2, GSM=1) is ~10% faster: 670 µs vs 745 µs baseline (median of
+# 100 trials × 2 passes). NUM_MMA_GROUPS=2 and replicate=2 are structural
+# (hard-coded into the producer/consumer barrier scheme) and not swept.
 
 
 # ---------------------------------------------------------------------------
