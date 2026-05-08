@@ -2474,7 +2474,7 @@ def ln_stats_and_bf16_cast(
     BR: tl.constexpr,
 ):
     """iter29: One-pass over fp32 x — compute LN mean/rstd inline AND store
-    bf16((x - mu) * rstd). Folds the LN-correction forward so the downstream
+    bf16((x - mu) * rstd). Folds the LN-correction forward so the down
     5-projection matmul produces `((x - mu) * rstd) @ B_g` directly and the
     post-pass (`fused_gate_ln_bmm_layout`) only has to add the `s2` bias.
 
@@ -2482,7 +2482,7 @@ def ln_stats_and_bf16_cast(
     normalized (x - mu) * rstd lives near unit scale — strictly more
     bf16-friendly than casting raw x.
 
-    `mean`/`rstd` are NOT exported: nothing downstream needs them after the
+    `mean`/`rstd` are NOT exported: nothing down needs them after the
     fold (the post-bmm `fused_invtr_ln_gate*` kernels compute their own LN
     over the `hd` axis).
     """
@@ -2868,7 +2868,7 @@ def custom_kernel(data: input_t) -> output_t:
     BD = triton.next_power_of_2(dim)
 
     # iter29: fold LN-correction forward — emit `bf16((x - mu) * rstd)` so the
-    # downstream matmul produces `((x - mu) * rstd) @ B_g` directly. This drops
+    # down matmul produces `((x - mu) * rstd) @ B_g` directly. This drops
     # the `mean`/`rstd` outputs (no consumer needed them after the fold), the
     # `mu * s1` term inside `fused_gate_ln_bmm_layout`, and the `rs *` scale.
     x_bf16 = torch.empty(T, dim, device=x_in.device, dtype=torch.bfloat16)

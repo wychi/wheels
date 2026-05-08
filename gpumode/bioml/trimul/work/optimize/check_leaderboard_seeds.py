@@ -147,7 +147,7 @@ TIER_MATRICES = {
     "T2": {"shape_idxs": [0, 1, 4, 6], "seeds": [731, 17, 99], "trials": 8},
     "T3": {
         "shape_idxs": list(range(7)),
-        "seeds": [731, 17, 99, 1, 2026, 9999],
+        "seeds": [731, 17, 99, 1, 2026, 9999, 381],
         "trials": 30,
     },
 }
