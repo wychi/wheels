@@ -237,3 +237,37 @@ Geo-mean speedup across 7 shapes: **2.04×**. All shapes pass `atol=2e-2` agains
 - **What needs to happen for the fusion to win:** keep all 5 N-chunk accumulators alive across a tight K-iter loop (so the WGMMA pipeline is fed continuously). That requires either (a) 5 fp32 accs per consumer WG simultaneously — iter18's 80-KB cliff at BM=64 — or (b) a tilewise interleaved-K design where each k-iter cycles through all 5 N-chunks before advancing k, with B-loads pipelined across chunks. Option (b) is essentially a partial monolithic S1 and is closer in spirit to iter18 Phase B than iter16. Out of scope for iter24.
 - **Time invested:** ~3 h (1 h kernel design + 1.5 h debugging local_slice wheel-API hole + 30 min profiling/abort).
 
+### iter25 — D=384 decomposed 2+2+1 fusion — **ABORT (fused kernels 64% slower than baseline path)**
+
+- **Hypothesis (PLAN_v4 §4 iter25):** Replace (`tlx_ws_matmul_fixed` producing [T, 5H] `proj` + `fused_gate_ln_bmm_layout` reading proj and emitting bmm-layout L/R + [T, hd] og) with three persistent kernels: `matmul_lr_kernel` (×2, for L and R: `[T,D]@[D,2H]` with LN-correction + sigmoid + mask + value*gate fused in epilogue, written transposed to `[B*hd, N²]` bmm layout) plus a trivial `matmul_og_kernel`. Eliminates `proj [T, 5H]` bf16 round-trip = 2.68 GB HBM saved on shape 6. Target: +5–8% on shape 6.
+- **Pencil-out (matmul-only, before writing fused kernels):**
+  - `tlx_ws_matmul_fixed [T,D]@[D,5H]` (existing, BM=256/BN=128) = 1167 µs
+  - `tlx_ws_matmul_fixed` 3-split sum = 706 + 706 + 527 = 1939 µs
+  - Existing post-pass (`fused_gate_ln_bmm_layout`) = 1170 µs → existing total = 2337 µs
+  - 3-split matmul-only sum vs current = **~+400 µs theoretical headroom (17%)** if fused epilogue adds zero overhead.
+- **Implementation hit two wheel-level blockers:**
+  - `tl.split` on the [BM_SPLIT, 2H]→[BM_SPLIT, 2, H] reshape **segfaults** the Triton compiler (`semantic.py:692`) on this acc layout. Forced a 2-WGMMA-per-K-iter design (one per H-half into separate fp32 accs `[BM_SPLIT, H]`) — halves WGMMA throughput vs single-WGMMA-on-[BM_SPLIT, 128].
+  - `tlx.local_slice` on a [BK, 2H] SMEM region fails — C++ binding `create_memdesc_subslice` signature mismatch (independently rediscovered by iter24). Forced two separate B TMA descriptors / SMEM allocs.
+- **Standalone bench (shape 6, T=1.05M, D=384, H=128):**
+
+  | Kernel | µs |
+  |---|---|
+  | `tlx_ws_matmul_fixed [T,D]@[D,5H]` (existing) | 1167 |
+  | `fused_gate_ln_bmm_layout` (existing post-pass) | 1170 |
+  | **Existing sum** | **2337** |
+  | `matmul_lr_kernel` L variant | 1582 |
+  | `matmul_lr_kernel` R variant | 1571 |
+  | `matmul_og_kernel` | 685 |
+  | **iter25 sum** | **3838** |
+  | **Δ** | **−1500 µs (iter25 is 64% slower)** |
+
+- **End-to-end with iter25 dispatched (vs baseline 5.404 ms shape 6):** shape 2 0.728 → **0.905 (+24%)**, shape 5 3.020 → **3.717 (+23%)**, shape 6 5.404 → **6.499 (+20%)**. D=128 untouched.
+- **Why it failed:**
+  1. `tl.split` segfault forced 2-WGMMA-per-K-iter — each `matmul_lr` does ~1.5× the WGMMA work of an unfused split.
+  2. Transpose-store overhead. Writing `[BM_SPLIT, H]` register tiles transposed into `[B*hd, N²]` bmm-layout (whether via TMA store + `tl.permute` or strided `tl.store`) measured ~600 µs/kernel — and iter14's `fused_gate_ln_bmm_layout` already runs near 2.2 TB/s HBM, leaving zero room.
+  3. **Even with both wheel fixes, the theoretical ceiling is ~+200 µs (3-4% e2e on shape 6) — tight enough to risk regression.**
+- **Pencil-out vs reality:** Predicted matmul sum 1939 µs; actual fused sum 3838 µs. Fusion overhead alone (~870 µs per `matmul_lr`) eats >4× the theoretical HBM savings. Each `tlx_ws_matmul_fixed [T,D]@[D,2H]` (706 µs unfused) became 1582 µs fused.
+- **Verdict — ABORT** per PLAN_v4 §4 iter25 abort rule. Reverted dispatch site to use the existing path. Kernels (`matmul_lr_kernel`, `matmul_og_kernel`, `tlx_ws_matmul_lr`, `tlx_ws_matmul_og`) and `_prep_weights` slicing additions retained in iter25 worktree only; **not merged**. T2 (after revert): 0/96 = 0.00%; T3: 8/1260 = 0.63% (matches iter15 baseline 0.95%, under 1.5% gate).
+- **What it would take to retry:** wheel rebuild fixing both `tl.split` codegen AND `tlx.local_slice` C++ binding. **Same wheel-level limit as iter21 (eviction_policy) and iter24 (local_slice).** Three independent iters in this campaign blocked by the same pybind/codegen surface.
+- **Time invested:** ~3 h (kernel design + 2 implementation passes + bench/standalone validation).
+
