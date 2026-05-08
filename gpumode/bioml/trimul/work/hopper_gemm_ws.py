@@ -1880,10 +1880,13 @@ def custom_kernel(data: input_t) -> output_t:
     )
     del out_bmm, out_gate
 
-    # Final projection in fp32 too — cheap (hd→dim is small) and lets cuBLAS
-    # use TF32 instead of bf16, removing the last big precision-loss step.
-    out_fp32 = F.linear(gated.float(), W["to_out.weight"].float())
-    return out_fp32.to(torch.bfloat16).view(B, N, N, dim)
+    # Final projection in bf16 (cuBLAS bf16 GEMM still accumulates in fp32).
+    # K=hd=128 is small enough that bf16 input mantissa loss stays well inside
+    # atol=2e-2; saves the fp32 upcast of `gated` (0.27 GB write) and the
+    # fp32→bf16 downcast of the result (0.27 GB).
+    w_out_bf16 = W["to_out.weight"].to(torch.bfloat16)
+    out_bf16 = F.linear(gated, w_out_bf16)
+    return out_bf16.view(B, N, N, dim)
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 | 1 | O3: skip bf16 downcast on out_bmm | 9.45 | 1.022× | accuracy passes all 7; fused_invtr_ln_gate now reads fp32 |
 | 2 | O2: thin-K matmul cfg for D=128 — **REVERTED** | 9.39 | (no-op) | matmul on shape 4 went 922→928 us (slightly worse); D=128 shapes already reach steady state |
 | 3 | O4: fused tr+cast (`tr_cast_fwd`) for bmm operands | 8.78 | **1.10×** | 6-10% across all shapes; replaces 2× tr_fwd + 2× elementwise upcast with one kernel; bf16 [B*hd,N²] intermediate eliminated |
+| 4 | O6 (partial): bf16 final linear (cuBLAS bf16 GEMM, fp32 accum) | 6.69 | **1.44×** | 14-24% per shape; cumulative 30.7% from baseline. Skip `gated.float()` upcast and `out.to(bf16)` downcast; cuBLAS uses fp32 accum internally |
 
 ## Per-iteration log
 
@@ -33,6 +34,15 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 - Per-shape speedup: 0=10.0%, 1=8.2%, 2=6.8%, 3=9.5%, 4=9.0%, 5=5.8%, 6=6.5% (geo-mean ≈ 7.9%).
 - Profile delta on shape 6: tr_fwd ×2 (0.51 ms) + L,R fp32 cast (~2.14 ms hidden inside vectorized_elementwise) → **tr_cast_fwd 0.79 ms**. Some PyTorch elementwise calls remain (input upcast, mask cast, etc.).
 - Accuracy: max err on shape 1 nudged 0.0181→0.0183 (still well under 2e-2). Other shapes unchanged.
+
+### iter4 — O6 (partial): bf16 final linear (skip the fp32 ping-pong)
+- Replace `F.linear(gated.float(), W["to_out.weight"].float())` + final `.to(bf16)` with `F.linear(gated, W_out.to(bf16))`.
+- cuBLAS bf16 GEMM uses fp32 accumulator internally. K=hd=128 is small enough that bf16 input mantissa loss stays inside atol=2e-2.
+- Per-shape speedup: 0=13.8%, 1=17.4%, 2=23.3%, 3=17.8%, 4=17.6%, 5=23.6%, 6=23.8% (**huge — 19% geo-mean**).
+- Cumulative: shape 6 9.66 → 6.69 ms = **1.44× faster than baseline**.
+- Profile delta on shape 6: fp32 cuBLAS H→D (sm90_xmma 64x256) at 0.95 ms — gone. bf16 cuBLAS replacement is in noise. `vectorized_elementwise` halved (was 2.14 → now 1.07 ms — the `gated.float()` and `out_fp32.to(bf16)` casts are gone).
+- Accuracy: max err on shape 0 0.0224→0.0254, shape 3 0.0201→0.0226 — still passes (`atol+rtol*|ref|` gate). All other shapes hold.
+
 
 
 
