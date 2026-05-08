@@ -19,6 +19,7 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 | 9 | multi-row fused_gate_ln (BR=4) | 5.12 | 1.89× | Tiny (≤1%) on all shapes — kernel was already at ~2.2 TB/s HBM peak. Kept for cleaner amortization of launch latency. |
 | 10 | weight cache (B_g, s1, s2, w_out) keyed by data_ptr | 5.10 | 1.90× | -6.5% shape 0, ≈0% large shapes. Skips per-call cat/cast/affine-mul. Safe for repeated bench calls; doesn't help when caller passes fresh weights. |
 | 10b | **PRECISION FIX**: cache fingerprint, fp32 bmm/og/output, remove hardcoded bf16 store cast in `fused_gate_ln`, revert iter8 fused proj for D=128 | 6.02 | 1.55× geo-mean | Triggered by GPUMode server failure. See `reports/precision_postmortem.md`. Adversarial sweep: 13/900 = 1.44% fail rate (down from 27% pre-fix); all 7 BENCHMARK_SHAPES pass seed-0 with max_err 0.013-0.023. |
+| 11 | TLX matmul tile/stage sweep — **NO WIN** | 5.97 | 1.62× | Tested 4 alternatives (BM256/NS4/MG1, BM128/NS4/MG2, BM256/NS2/MG2, BM128/NS5/MG2). All within ±1.5% of baseline; deeper-NS configs that needed BM=256 (256 KB) don't fit the 228 KB cap. Baseline already near local optimum for SMEM-constrained tiles. Matches iter10 NCU finding (matmul TC SoL stuck at 65%). Move to iter12. |
 
 ## Final summary (per shape, baseline → iter10)
 
