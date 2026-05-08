@@ -1828,10 +1828,12 @@ def custom_kernel(data: input_t) -> output_t:
     # Promote bmm to fp32 (TF32 via cuBLAS): bf16 bmm over K=seq_len accumulates
     # ~sqrt(K)*0.4% relative error, which exceeds atol=2e-2 for sl ≥ 512 with
     # cauchy-tailed values. TF32's 10-bit mantissa cuts that by ~10x.
+    # Keep result fp32 — fused_invtr_ln_gate now consumes fp32 directly,
+    # eliminating the 1.07 GB bf16 cast that costs ~1.5 ms on the largest shape.
     Lf = L.view(B * hd, N, N).float()
     Rf = R.view(B * hd, N, N).float()
     del L, R
-    out_bmm = torch.bmm(Lf, Rf.transpose(-1, -2)).to(torch.bfloat16)
+    out_bmm = torch.bmm(Lf, Rf.transpose(-1, -2))
     del Lf, Rf
 
     TI6 = 64

@@ -1,0 +1,45 @@
+# Triton 3.7.0, torch 2.11.0+cu129, GPU NVIDIA H100
+
+## Per-shape end-to-end
+| # | bs | seqlen | dim | hd | mask | dist | ms (med) | ms (p10–p90) | TF/s e2e | max abs err | mean abs err |
+|---|----|--------|-----|----|------|------|----------|--------------|----------|-------------|--------------|
+| 0 | 2 | 256 | 128 | 128 | no | normal | **0.948** | 0.941–0.957 | 36.2 | 0.0199 | 0.001827 |
+| 1 | 1 | 768 | 128 | 128 | no | cauchy | **3.795** | 3.784–3.804 | 61.1 | 0.01932 | 0.00176 |
+| 2 | 2 | 256 | 384 | 128 | yes | normal | **1.275** | 1.267–1.284 | 67.4 | 0.01213 | 0.001132 |
+| 3 | 1 | 512 | 128 | 128 | no | normal | **1.731** | 1.720–1.743 | 49.6 | 0.02075 | 0.001752 |
+| 4 | 1 | 1024 | 128 | 128 | no | cauchy | **6.729** | 6.706–6.753 | 71.5 | 0.0183 | 0.001759 |
+| 5 | 1 | 768 | 384 | 128 | yes | normal | **5.349** | 5.336–5.364 | 86.7 | 0.01235 | 0.001135 |
+| 6 | 1 | 1024 | 384 | 128 | no | normal | **9.453** | 9.441–9.468 | 94.5 | 0.0121 | 0.0009919 |
+
+## Per-kernel breakdown — largest shape: {'bs': 1, 'dim': 384, 'distribution': 'normal', 'hiddendim': 128, 'nomask': True, 'seqlen': 1024}
+```
+/home/wychi/oss/wheels/.venv/lib/python3.13/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+void at::native::vectorized_elementwise_kernel<8, at...         0.00%       0.000us         0.00%       0.000us       0.000us      42.899ms        22.91%      42.899ms     714.978us            60  
+void at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us      26.822ms        14.32%      26.822ms     447.025us            60  
+                                   matmul_kernel_tlx_ws         0.00%       0.000us         0.00%       0.000us       0.000us      22.883ms        12.22%      22.883ms       1.144ms            20  
+sm90_xmma_gemm_f32f32_tf32f32_f32_tn_n_tilesize128x1...         0.00%       0.000us         0.00%       0.000us       0.000us      21.922ms        11.71%      21.922ms       1.096ms            20  
+                                          fused_gate_ln         0.00%       0.000us         0.00%       0.000us       0.000us      19.338ms        10.33%      19.338ms     966.912us            20  
+sm90_xmma_gemm_f32f32_tf32f32_f32_tn_n_tilesize64x25...         0.00%       0.000us         0.00%       0.000us       0.000us      18.890ms        10.09%      18.890ms     944.502us            20  
+                                      ln_stats_multirow         0.00%       0.000us         0.00%       0.000us       0.000us      14.498ms         7.74%      14.498ms     724.903us            20  
+                                                 tr_fwd         0.00%       0.000us         0.00%       0.000us       0.000us      10.153ms         5.42%      10.153ms     253.823us            40  
+                                    fused_invtr_ln_gate         0.00%       0.000us         0.00%       0.000us       0.000us       9.433ms         5.04%       9.433ms     471.644us            20  
+std::enable_if<!(false), void>::type internal::gemvx...         0.00%       0.000us         0.00%       0.000us       0.000us     132.067us         0.07%     132.067us       3.302us            40  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us      66.145us         0.04%      66.145us       3.307us            20  
+void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_...         0.00%       0.000us         0.00%       0.000us       0.000us      65.379us         0.03%      65.379us       3.269us            20  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us      49.663us         0.03%      49.663us       2.483us            20  
+void at::native::(anonymous namespace)::CatArrayBatc...         0.00%       0.000us         0.00%       0.000us       0.000us      46.208us         0.02%      46.208us       2.310us            20  
+                                        Memset (Device)         0.00%       0.000us         0.00%       0.000us       0.000us      35.902us         0.02%      35.902us       0.898us            40  
+void cublasLt::splitKreduce_kernel<32, 16, int, floa...         0.00%       0.000us         0.00%       0.000us       0.000us      33.439us         0.02%      33.439us       1.672us            20  
+                                Activity Buffer Request         0.55%     995.586us         0.55%     995.586us     995.586us       0.000us         0.00%       0.000us       0.000us             1  
+                                       cuLaunchKernelEx         0.24%     432.884us         0.24%     432.884us       3.607us       0.000us         0.00%       0.000us       0.000us           120  
+                                       cudaLaunchKernel         0.46%     827.300us         0.46%     827.300us       3.447us       0.000us         0.00%       0.000us       0.000us           240  
+                                        cudaMemsetAsync         0.09%     166.985us         0.09%     166.985us       4.175us       0.000us         0.00%       0.000us       0.000us            40  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 180.613ms
+Self CUDA time total: 187.265ms
+
+```
