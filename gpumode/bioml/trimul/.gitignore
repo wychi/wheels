@@ -1,2 +1,5 @@
 profile/
 work/__pycache__/
+.claude/
+.codex/
+.popcorn/
