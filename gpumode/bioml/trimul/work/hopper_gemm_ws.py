@@ -1661,6 +1661,253 @@ def tlx_ws_matmul_fixed(a, b, out_dtype=torch.bfloat16):
 
 
 # ---------------------------------------------------------------------------
+# iter15: custom Triton bmm — bf16-in / fp32-out, replaces
+#   torch.bmm(L, R.transpose(-1,-2)).float()
+#
+# Per batch (b ∈ [0, B*hd)) we compute:
+#   out[b, i, j] = sum_k L[b, i, k] * R[b, j, k]
+# with L, R in shape [B*hd, N, N] row-major bf16. The motivation is not the
+# matmul itself (cuBLAS is excellent here) but eliminating the post-bmm
+# bf16→fp32 cast that costs ~450 µs on shape 6 — almost as much as the
+# matmul. Writing fp32 directly inside the matmul epilogue saves that pass.
+#
+# Design: persistent warp-spec GEMM (replicate=2 consumers, like
+# matmul_kernel_tlx_ws), 3D iteration over (batch, m_tile, n_tile).
+# B-side load is `[BN, BK]` (R[j_block, k_block]); we use
+# `tlx.local_trans` to present it as `[BK, BN]` to async_dot.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def bmm_kernel_tlx_ws(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    BATCH,
+    N,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    NUM_MMA_GROUPS: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    """Persistent warp-spec batched bmm: per-batch [N,N] @ [N,N]^T → fp32 [N,N].
+
+    Inputs a_ptr (=L) and b_ptr (=R) point to bf16 tensors of shape
+    [BATCH, N, N] row-major. c_ptr is fp32 [BATCH, N, N] row-major.
+    """
+    BLOCK_M_SPLIT: tl.constexpr = BM // NUM_MMA_GROUPS
+
+    # 3D TMA descriptors, one per (batch_size, N, N) tensor. Strides are
+    # [N*N, N, 1] for batch-major row-major.
+    a_desc = tlx.make_tensor_descriptor(
+        desc_ptr=None,
+        base=a_ptr,
+        shape=[BATCH, N, N],
+        strides=[N * N, N, 1],
+        block_shape=[1, BLOCK_M_SPLIT, BK],
+    )
+    b_desc = tlx.make_tensor_descriptor(
+        desc_ptr=None,
+        base=b_ptr,
+        shape=[BATCH, N, N],
+        strides=[N * N, N, 1],
+        block_shape=[1, BN, BK],
+    )
+    c_desc = tlx.make_tensor_descriptor(
+        desc_ptr=None,
+        base=c_ptr,
+        shape=[BATCH, N, N],
+        strides=[N * N, N, 1],
+        block_shape=[1, BLOCK_M_SPLIT, BN],
+    )
+
+    a = tlx.local_alloc(
+        (BLOCK_M_SPLIT, BK), tlx.dtype_of(a_ptr), NUM_STAGES * NUM_MMA_GROUPS
+    )
+    b = tlx.local_alloc((BN, BK), tlx.dtype_of(b_ptr), NUM_STAGES)
+
+    bars_empty_a = tlx.alloc_barriers(
+        num_barriers=NUM_STAGES * NUM_MMA_GROUPS, arrive_count=1
+    )
+    bars_empty_b = tlx.alloc_barriers(
+        num_barriers=NUM_STAGES, arrive_count=NUM_MMA_GROUPS
+    )
+    bars_full_a = tlx.alloc_barriers(
+        num_barriers=NUM_STAGES * NUM_MMA_GROUPS, arrive_count=1
+    )
+    bars_full_b = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
+
+    num_pid_m = tl.cdiv(N, BM)
+    num_pid_n = tl.cdiv(N, BN)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    tiles_per_batch = num_pid_m * num_pid_n
+    num_tiles = BATCH * tiles_per_batch
+
+    with tlx.async_tasks():
+        with tlx.async_task("default"):
+            sm_id = tl.program_id(axis=0)
+            tile_id = sm_id
+            smem_accum_cnt = 0
+            while tile_id < num_tiles:
+                bid = tile_id // tiles_per_batch
+                pid = tile_id % tiles_per_batch
+                group_id = pid // num_pid_in_group
+                first_pid_m = group_id * GROUP_SIZE_M
+                group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+                pid_m = first_pid_m + (pid % group_size_m)
+                pid_n = (pid % num_pid_in_group) // group_size_m
+                offset_am = pid_m * BM
+                offset_bn = pid_n * BN
+
+                for k in range(0, tl.cdiv(N, BK)):
+                    buf, p = _get_bufidx_phase(smem_accum_cnt, NUM_STAGES)
+                    offset_k = k * BK
+
+                    empty_a_1st = tlx.local_view(bars_empty_a, buf)
+                    full_a_1st = tlx.local_view(bars_full_a, buf)
+                    tlx.barrier_wait(bar=empty_a_1st, phase=p ^ 1)
+                    tlx.barrier_expect_bytes(
+                        full_a_1st,
+                        BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_ptr)),
+                    )
+                    data_a_1st = tlx.local_view(a, buf)
+                    tlx.async_descriptor_load(
+                        a_desc,
+                        data_a_1st,
+                        [bid, offset_am, offset_k],
+                        full_a_1st,
+                    )
+
+                    empty_b = tlx.local_view(bars_empty_b, buf)
+                    full_b = tlx.local_view(bars_full_b, buf)
+                    tlx.barrier_wait(bar=empty_b, phase=p ^ 1)
+                    tlx.barrier_expect_bytes(
+                        full_b, BN * BK * tlx.size_of(tlx.dtype_of(a_ptr))
+                    )
+                    data_b = tlx.local_view(b, buf)
+                    tlx.async_descriptor_load(
+                        b_desc,
+                        data_b,
+                        [bid, offset_bn, offset_k],
+                        full_b,
+                    )
+
+                    empty_a_2nd = tlx.local_view(bars_empty_a, buf + NUM_STAGES)
+                    full_a_2nd = tlx.local_view(bars_full_a, buf + NUM_STAGES)
+                    tlx.barrier_wait(bar=empty_a_2nd, phase=p ^ 1)
+                    tlx.barrier_expect_bytes(
+                        bar=full_a_2nd,
+                        size=BLOCK_M_SPLIT * BK * tlx.size_of(tlx.dtype_of(a_ptr)),
+                    )
+                    data_a_2nd = tlx.local_view(a, buf + NUM_STAGES)
+                    tlx.async_descriptor_load(
+                        a_desc,
+                        data_a_2nd,
+                        [bid, offset_am + BLOCK_M_SPLIT, offset_k],
+                        full_a_2nd,
+                    )
+
+                    smem_accum_cnt += 1
+                tile_id += NUM_SMS
+
+        with tlx.async_task(num_warps=4, replicate=2):
+            sm_id = tl.program_id(axis=0)
+            tile_id = sm_id
+            smem_accum_cnt = 0
+            while tile_id < num_tiles:
+                bid = tile_id // tiles_per_batch
+                pid = tile_id % tiles_per_batch
+                group_id = pid // num_pid_in_group
+                first_pid_m = group_id * GROUP_SIZE_M
+                group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+                pid_m = first_pid_m + (pid % group_size_m)
+                pid_n = (pid % num_pid_in_group) // group_size_m
+                offset_am = pid_m * BM
+                offset_bn = pid_n * BN
+
+                acc = tl.zeros([BM // 2, BN], dtype=tl.float32)
+                for k in range(0, tl.cdiv(N, BK)):
+                    buf, p = _get_bufidx_phase(smem_accum_cnt, NUM_STAGES)
+
+                    full_a = tlx.local_view(
+                        bars_full_a, buf + NUM_STAGES * tlx.async_task_replica_id()
+                    )
+                    full_b = tlx.local_view(bars_full_b, buf)
+                    tlx.barrier_wait(bar=full_a, phase=p)
+                    tlx.barrier_wait(bar=full_b, phase=p)
+
+                    data_a = tlx.local_view(
+                        a, buf + NUM_STAGES * tlx.async_task_replica_id()
+                    )
+                    data_b = tlx.local_view(b, buf)
+                    # B is stored as [BN, BK] (R[j_block, k_block]); we want
+                    # [BK, BN] for the dot since we're computing
+                    # out[i, j] = sum_k L[i, k] * R[j, k] = sum_k A[i,k] * B[j,k]
+                    # = (A @ B^T)[i, j]. Transpose the SMEM tile.
+                    data_b_t = tlx.local_trans(data_b)
+                    acc = tlx.async_dot(data_a, data_b_t, acc)
+                    acc = tlx.async_dot_wait(tl.constexpr(0), acc)
+
+                    empty_a = tlx.local_view(
+                        bars_empty_a, buf + NUM_STAGES * tlx.async_task_replica_id()
+                    )
+                    empty_b = tlx.local_view(bars_empty_b, buf)
+                    tlx.barrier_arrive(empty_a)
+                    tlx.barrier_arrive(empty_b)
+
+                    smem_accum_cnt += 1
+
+                offset_cm = offset_am + BLOCK_M_SPLIT * tlx.async_task_replica_id()
+                # fp32 store via TMA descriptor (3D — leading 1 for batch slot)
+                acc3d = tl.reshape(acc, (1, BM // 2, BN))
+                c_desc.store([bid, offset_cm, offset_bn], acc3d)
+
+                tile_id += NUM_SMS
+
+
+BMM_TLX_CONFIG = dict(
+    BM=128,
+    BN=128,
+    BK=64,
+    GROUP_SIZE_M=8,
+    NUM_STAGES=3,
+    NUM_MMA_GROUPS=2,
+)
+
+
+def tlx_ws_bmm_fp32(L, R):
+    """L, R: bf16 [B*hd, N, N]. Return fp32 [B*hd, N, N] = bmm(L, R^T).
+
+    Drop-in for `torch.bmm(L, R.transpose(-1, -2)).float()`.
+    """
+    assert L.is_contiguous() and R.is_contiguous()
+    assert L.shape == R.shape and L.dtype == torch.bfloat16
+    BATCH, M, K = L.shape
+    assert M == K, f"square per-batch matmul required, got M={M} K={K}"
+    N = M
+    out = torch.empty((BATCH, N, N), dtype=torch.float32, device=L.device)
+    triton.set_allocator(_alloc_fn)
+    cfg = BMM_TLX_CONFIG
+    num_tiles = BATCH * triton.cdiv(N, cfg["BM"]) * triton.cdiv(N, cfg["BN"])
+    grid = (min(NUM_SMS, num_tiles),)
+    bmm_kernel_tlx_ws[grid](
+        L,
+        R,
+        out,
+        BATCH,
+        N,
+        NUM_SMS=NUM_SMS,
+        num_stages=1,
+        num_warps=4,
+        **cfg,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Pre/post-matmul helper kernels
 # ---------------------------------------------------------------------------
 
@@ -2121,14 +2368,12 @@ def custom_kernel(data: input_t) -> output_t:
     del proj, mean, rstd, s1, s2
     L = L.view(B * hd, N, N)
     R = R.view(B * hd, N, N)
-    # Promote bmm output to fp32 to avoid the third bf16 round-trip in the
-    # cascade (bmm round → gated round → final round). With the bf16 round
-    # removed here, the fused LN/gate/dot kernel reads fp32, computes in fp32,
-    # and the only remaining bf16 quantization is the final tl.dot input — one
-    # rounding step instead of two. Adds ~150-300 µs of cast traffic but
-    # restores the precision margin needed by the leaderboard's `atol=2e-2 +
-    # rtol*|ref|` gate on adversarial weight draws.
-    out_bmm = torch.bmm(L, R.transpose(-1, -2)).float()
+    # iter15: replace `torch.bmm(L, R.T).float()` with a single TLX warp-spec
+    # kernel that does bf16-input + fp32-accum + fp32-output. The motivation
+    # isn't beating cuBLAS at the matmul itself (it ~ties); it's eliminating
+    # the bf16→fp32 elementwise cast that costs ~450 µs on shape 6 (almost
+    # as much as the matmul). Saves ~210 µs / shape 6 = 3.8% e2e.
+    out_bmm = tlx_ws_bmm_fp32(L, R)
     del L, R
 
     # cuBLAS bf16 GEMM for the final H→D linear in both D=128 and D=384 paths:

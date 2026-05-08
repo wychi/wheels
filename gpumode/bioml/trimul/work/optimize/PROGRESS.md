@@ -22,6 +22,7 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 | 11 | TLX matmul tile/stage sweep — **NO WIN** | 5.97 | 1.62× | Tested 4 alternatives (BM256/NS4/MG1, BM128/NS4/MG2, BM256/NS2/MG2, BM128/NS5/MG2). All within ±1.5% of baseline; deeper-NS configs that needed BM=256 (256 KB) don't fit the 228 KB cap. Baseline already near local optimum for SMEM-constrained tiles. Matches iter10 NCU finding (matmul TC SoL stuck at 65%). Move to iter12. |
 | 12 | Cluster size 2 + TMA multicast — **BLOCKED** | 6.02 | 1.55× | Setting `NUM_CTAS=2` and launching with `num_ctas=2` triggers `utlx: op 'ttng.map_to_remote_buffer' not registered in this Triton build`. The multicast TMA op the kernel emits is not in the current Triton+uTLX wheel. Reverted; would need a uTLX patch or a Triton bump. Move to iter14. |
 | 14 | 2D-tiled `fused_gate_ln_bmm_layout` — kills `tr_fwd_pair` | **5.57** | **1.67×** | Replaces (`fused_gate_ln` writing lf/rf [T,hd] + `tr_fwd_pair` reading them and writing L/R [B*hd,N²]) with a single kernel that does LN/gate math AND the transpose on store. Eliminates ~0.54 GB of intermediate traffic. Per-shape: 0=-7.5%, 1=-8.9%, 2=-6.4%, 3=-8.9%, 4=-9.3%, 5=-6.4%, 6=-7.4%. Adversarial sweep IMPROVED: 7/900=0.78% fail rate (vs iter10b's 1.44%). Worst max_err 0.060. |
+| 15 | Custom Triton `bmm_kernel_tlx_ws` (bf16-in/fp32-out) — replaces cuBLAS bf16 bmm + `.float()` cast | **5.35** | **1.81×** | Persistent warp-spec GEMM (BM=128, BN=128, BK=64, NUM_STAGES=3, NUM_MMA_GROUPS=2, GROUP_SIZE_M=8, replicate=2 consumers). 3D TMA descriptors over (B*hd, N, N); B is loaded `[BN, BK]` and `local_trans`'d to `[BK, BN]` for the dot — saves a separate transpose. The real win isn't beating cuBLAS at the matmul; it's eliminating the **post-bmm bf16→fp32 elementwise cast** (~451 µs on shape 6, almost as much as the matmul itself) by writing fp32 directly inside the epilogue. Per-shape: 0=-5.9%, 1=-5.7%, 2=-4.9%, 3=-6.2%, 4=-5.2%, 5=-4.1%, 6=-4.2%. Adversarial sweep: **0/210=0.0% fail rate** (down from iter14's 0.78%). Standalone bmm: 1.26-1.40× vs `torch.bmm + .float()`. |
 
 ## Final summary (per shape, baseline → iter10)
 
@@ -114,7 +115,14 @@ Geo-mean speedup across 7 shapes: **2.04×**. All shapes pass `atol=2e-2` agains
 - Profile delta on shape 6: tr_cast_fwd 0.79 ms → tr_fwd_pair 0.51 ms (-0.28); fp32 cuBLAS einsum 1.10 ms → bf16 cuBLAS einsum is no longer in the top 9 (sub-0.5 ms); fused_invtr_ln_gate 0.47 → 0.36 ms (reads bf16 instead of fp32).
 - Accuracy: cauchy shape 1 max_err 0.0192→0.0217, shape 4 0.0187→0.0205 — still passes the `atol+rtol*|ref|` gate. Tighter than feared.
 
+### iter15 — Custom Triton bmm (`bmm_kernel_tlx_ws`) replaces cuBLAS bf16 bmm + `.float()` cast
 
-
-
+- **Hypothesis (revised mid-iter):** The PLAN_v3 entry framed this as "beat cuBLAS by L2 grouping". Profile re-read showed the real prize is the post-bmm `bf16→fp32` cast: shape-6 baseline had `nvjet_tst_192x192_64x4_*` at 537 µs **plus** `unrolled_elementwise` at 451 µs (the `.float()` on `out_bmm`). A custom kernel that writes fp32 directly inside the matmul epilogue eliminates the entire 451 µs cast pass.
+- **Design:** Persistent TLX warp-specialized GEMM modeled on `matmul_kernel_tlx_ws`. 3D TMA descriptors over the `[B*hd, N, N]` tensors (batch slot in dim 0). Two consumer warpgroups via `replicate=2`, split-M (`BLOCK_M_SPLIT = BM // 2`). B operand is loaded `[BN, BK]` (R is `[N, N]` row-major in K-fast layout) and `tlx.local_trans`'d to `[BK, BN]` before `async_dot` — avoids a separate transpose kernel.
+- **Config:** `BM=128, BN=128, BK=64, NUM_STAGES=3, NUM_MMA_GROUPS=2, GROUP_SIZE_M=8`. SMEM: A = 3·2·64·64·2 = 49 KiB, B = 3·64·128·2 = 49 KiB → 98 KiB, well under the 232 KiB cap. Persistent grid `(NUM_SMS,)=(132,)`. For shape 6 (BATCH=128, N=1024) this is 8192 tiles ≈ 62 tiles per SM — comfortable steady-state.
+- **Standalone bmm** (just the kernel vs `torch.bmm + .float()`): 1.26–1.40× faster across shapes; on shape 6 dims (B*hd=128, N=1024): 924 µs → 711 µs. Numerics differ from cuBLAS by ~1-2% relative (different reduction-tree ordering for bf16 accumulation), well inside the leaderboard tolerance.
+- **End-to-end** (shape 6): 5.581 ms → 5.347 ms (**−4.2%**, +0.234 ms saved). All 7 shapes improve by 4.1–6.2%.
+- **Adversarial sweep** (7 shapes × 30 trials, seed=731): **0/210 = 0.0%** failures (vs iter14's 7/900 = 0.78%). Worst max_err 0.042 on shape 4 (cauchy, N=1024) — same shape as before, comparable margin.
+- **Profile delta on shape 6:** old `nvjet_tst_192x192_64x4_2x1_v_bz_coopB_TNN` (537 µs/call) + `unrolled_elementwise` cast (451 µs/call) → new `bmm_kernel_tlx_ws` 687 µs/call, cast eliminated. Net: 988 → 687 = −301 µs/call ≈ 5.4 % e2e budget reclaimed; 4.2 % shows up in median (some pipeline overlap was already hiding the cast).
+- **Cumulative vs baseline:** shape 6 = 1.88×.
 
