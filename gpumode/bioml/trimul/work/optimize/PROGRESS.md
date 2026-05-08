@@ -12,6 +12,7 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 | 3 | O4: fused tr+cast (`tr_cast_fwd`) for bmm operands | 8.78 | **1.10×** | 6-10% across all shapes; replaces 2× tr_fwd + 2× elementwise upcast with one kernel; bf16 [B*hd,N²] intermediate eliminated |
 | 4 | O6 (partial): bf16 final linear (cuBLAS bf16 GEMM, fp32 accum) | 6.69 | **1.44×** | 14-24% per shape; cumulative 30.7% from baseline. Skip `gated.float()` upcast and `out.to(bf16)` downcast; cuBLAS uses fp32 accum internally |
 | 5 | O1: bf16 einsum bmm (cuBLAS bf16 GEMM, fp32 accum) | 5.82 | **1.66×** | 13-20% per shape; cumulative 39.7% from baseline. Skip the fp32 cast on L,R; tr_cast_fwd → tr_fwd_pair (no upcast). bmm output now bf16 (LN inside fused_invtr_ln_gate reloads as fp32). |
+| 6 | O10: fold fp32→bf16 cast of x into ln_stats (`ln_stats_and_bf16_cast`) | 5.12 | **1.89×** | 6-13% per shape; cumulative 47.0% from baseline. Saves second read of [T,D] fp32. |
 
 ## Per-iteration log
 
@@ -43,6 +44,13 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 - Cumulative: shape 6 9.66 → 6.69 ms = **1.44× faster than baseline**.
 - Profile delta on shape 6: fp32 cuBLAS H→D (sm90_xmma 64x256) at 0.95 ms — gone. bf16 cuBLAS replacement is in noise. `vectorized_elementwise` halved (was 2.14 → now 1.07 ms — the `gated.float()` and `out_fp32.to(bf16)` casts are gone).
 - Accuracy: max err on shape 0 0.0224→0.0254, shape 3 0.0201→0.0226 — still passes (`atol+rtol*|ref|` gate). All other shapes hold.
+
+### iter6 — O10 (partial): fold fp32→bf16 cast of x into ln_stats
+- New Triton kernel `ln_stats_and_bf16_cast` reads fp32 x once, writes mean+rstd AND bf16-cast x. Replaces `ln_stats_multirow` + `x_flat.to(bf16)` elementwise pair.
+- Saves the second pass over [T, D] fp32 (~1.6 GB on shape 6) — partly offset by the new bf16 write (~0.8 GB).
+- Per-shape speedup: 0=5.4%, 1=6.3%, 2=12.6%, 3=6.2%, 4=6.1%, 5=12.1%, 6=12.1%.
+- Cumulative shape 6: 5.82 → 5.12 ms = **1.89× faster than baseline**.
+- Note: shape 0 first-iter shows 2.5 ms (JIT compile of new kernel costs); steady-state matches the warm number above.
 
 ### iter5 — O1: bf16 einsum bmm (Codex's "no precision restoration" insight)
 - Drop the bf16→fp32 upcast in `tr_cast_fwd` → renamed `tr_fwd_pair` (just transpose). Run `torch.bmm` on bf16 inputs; cuBLAS uses fp32 accumulator internally. Output is bf16 (cuBLAS lacks bf16-in/fp32-out via `torch.bmm`).

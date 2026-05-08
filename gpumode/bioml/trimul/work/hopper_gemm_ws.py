@@ -1668,6 +1668,36 @@ def ln_stats_multirow(
 
 
 @triton.jit
+def ln_stats_and_bf16_cast(
+    x_ptr,
+    x_bf16_ptr,
+    mean_ptr,
+    rstd_ptr,
+    T,
+    dim: tl.constexpr,
+    eps: tl.constexpr,
+    BD: tl.constexpr,
+    BR: tl.constexpr,
+):
+    """One-pass over fp32 x: compute LN mean/rstd AND store bf16-cast x for
+    the downstream 5-projection matmul. Replaces ln_stats_multirow + a
+    separate fp32→bf16 elementwise cast (~0.4 GB write per call on shape 6)."""
+    pid = tl.program_id(0)
+    c = tl.arange(0, BD)
+    m = c < dim
+    for i in range(BR):
+        r = pid * BR + i
+        if r < T:
+            base = r * dim + c
+            x = tl.load(x_ptr + base, mask=m, other=0.0).to(tl.float32)
+            mu = tl.sum(x) / dim
+            xc = x - mu
+            tl.store(mean_ptr + r, mu)
+            tl.store(rstd_ptr + r, tl.rsqrt(tl.sum(xc * xc) / dim + eps))
+            tl.store(x_bf16_ptr + base, x.to(tl.bfloat16), mask=m)
+
+
+@triton.jit
 def fused_gate_ln(
     proj_ptr,
     mask_ptr,
@@ -1809,9 +1839,18 @@ def custom_kernel(data: input_t) -> output_t:
 
     mean = torch.empty(T, device=x_in.device, dtype=torch.float32)
     rstd = torch.empty(T, device=x_in.device, dtype=torch.float32)
-    ln_stats_multirow[(triton.cdiv(T, 4),)](
-        x_flat, mean, rstd, T, dim=dim, eps=1e-5, BD=BD, BR=4, num_warps=1
-    )
+    if x_flat.dtype != torch.bfloat16:
+        # Fold the fp32→bf16 cast of x into the LN-stats pass — both touch the
+        # same [T, D] fp32 array; doing them together saves the second read.
+        x_bf16 = torch.empty(T, dim, device=x_in.device, dtype=torch.bfloat16)
+        ln_stats_and_bf16_cast[(triton.cdiv(T, 4),)](
+            x_flat, x_bf16, mean, rstd, T, dim=dim, eps=1e-5, BD=BD, BR=4, num_warps=1
+        )
+        x_flat = x_bf16
+    else:
+        ln_stats_multirow[(triton.cdiv(T, 4),)](
+            x_flat, mean, rstd, T, dim=dim, eps=1e-5, BD=BD, BR=4, num_warps=1
+        )
 
     ln_w, ln_b = W["norm.weight"], W["norm.bias"]
     fat_w = torch.cat(
@@ -1829,8 +1868,6 @@ def custom_kernel(data: input_t) -> output_t:
     s1 = ln_w @ fat_f
     s2 = ln_b @ fat_f
     del fat_w, fat_f
-    if x_flat.dtype != torch.bfloat16:
-        x_flat = x_flat.to(torch.bfloat16)
     proj = tlx_ws_matmul_fixed(x_flat, B_g, out_dtype=torch.bfloat16)
     del B_g
 
