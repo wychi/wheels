@@ -1354,6 +1354,87 @@ import triton
 import triton.language as tl
 import utlx_plugin as tlx
 
+
+# ---------------------------------------------------------------------------
+# iter24 inline patch: fix `tlx.local_slice` to call the new (type, value,
+# offsets) binding signature on `create_memdesc_subslice`.
+#
+# The shipped utlx_plugin/mem_ops.py:355 calls the binding as
+#   create_memdesc_subslice(buffer.handle, offset_list, shape_list)
+# but the current GluonOpBuilder binding signature is
+#   create_memdesc_subslice(result_type, source_value, offsets_list)
+# (per `help(GluonOpBuilder.create_memdesc_subslice)` after gluon_op_builder
+# swap). The wheel's wrapper drops the result_type and conflates `shape`
+# with `offsets`, so any non-trivial slice fails at compile time. We replace
+# `tlx.local_slice` with a wrapper that constructs the correct result type
+# via `get_shared_mem_desc_ty` and calls the binding properly.
+# ---------------------------------------------------------------------------
+def _install_local_slice_fix():
+    import triton.language.core as _tl
+
+    _orig_local_slice = tlx.local_slice
+
+    @_tl.builtin
+    def _patched_local_slice(buffer, offset, shape, _semantic=None):
+        """Multi-dim slice of an SMEM buffered_tensor.
+
+        offset: list of N ints (one per buffer rank), shape: list of N ints
+        for the result extent. We construct the result memdesc type via
+        `get_shared_mem_desc_ty(elem_ty, shape, layout, alloc_shape)` and call
+        `create_memdesc_subslice(result_ty, src.handle, offsets)`.
+        """
+        if buffer.type.storage == tlx.storage_kind.tmem:
+            # Defer TMEM path to the original (TMEM uses a different op).
+            return _orig_local_slice(buffer, offset, shape, _semantic=_semantic)
+
+        builder = _semantic.builder
+        # Unwrap constexpr ints
+        off = [int(_tl._unwrap_if_constexpr(o)) for o in offset]
+        shp = [int(_tl._unwrap_if_constexpr(s)) for s in shape]
+        # Pull the layout off the source memdesc value via
+        # `get_gluon_layout_from_memdesc`, then convert the Python layout
+        # object back to an MLIR attribute via its `_to_ir(builder)` method.
+        py_layout = builder.get_gluon_layout_from_memdesc(buffer.handle)
+        layout_attr = py_layout._to_ir(builder)
+        # alloc_shape mirrors the source buffer's shape (same allocation).
+        alloc_shape = [int(d) for d in buffer.type.shape]
+        elem_ty = _make_type_carrier_local(builder, buffer.type.scalar)
+        result_ty = builder.get_shared_mem_desc_ty(
+            elem_ty, shp, layout_attr, alloc_shape
+        )
+        slice_handle = builder.create_memdesc_subslice(result_ty, buffer.handle, off)
+        return tlx.buffered_tensor(
+            slice_handle,
+            buffer.type.scalar,
+            list(shp),
+            0,
+            buffer.type.storage,
+            buffer.type.layout,
+        )
+
+    def _make_type_carrier_local(builder, dtype):
+        # Map Triton dtype → builder ir-type getter (returns ir.type directly).
+        method_map = {
+            tl.float16: "get_half_ty",
+            tl.bfloat16: "get_bf16_ty",
+            tl.float32: "get_float_ty",
+            tl.float64: "get_double_ty",
+            tl.int8: "get_int8_ty",
+            tl.int16: "get_int16_ty",
+            tl.int32: "get_int32_ty",
+            tl.int64: "get_int64_ty",
+            tl.uint8: "get_int8_ty",
+            tl.uint16: "get_int16_ty",
+            tl.uint32: "get_int32_ty",
+            tl.uint64: "get_int64_ty",
+        }
+        return getattr(builder, method_map[dtype])()
+
+    tlx.local_slice = _patched_local_slice
+
+
+_install_local_slice_fix()
+
 try:
     from task import input_t, output_t
 except ImportError:
@@ -1878,6 +1959,442 @@ BMM_TLX_CONFIG = dict(
 )
 
 
+# ---------------------------------------------------------------------------
+# iter24: D=128 deep fusion — matmul + gate-LN epilogue, in one kernel.
+#
+# This kernel replaces the two-kernel sequence
+#   `tlx_ws_matmul_fixed`  (writes proj [T, 5*hd] bf16, ~1.34 GB on shape 4)
+#   `fused_gate_ln_bmm_layout` (consumes proj, applies LN/gate/sigmoid, writes
+#                               L,R [B*hd,N²] bf16 + out_gate [T,hd] fp32)
+# with a single warp-spec GEMM that, after each WGMMA chunk, applies LN-
+# correction + sigmoid + mask + gate-multiply and writes L/R/og directly in
+# bmm-friendly layout. The proj intermediate is never materialized in HBM.
+#
+# Hard-coded for D=128 / hd=128 / BM=128 / BN=128 / BK=64 / NUM_STAGES=3 /
+# NUM_MMA_GROUPS=2 (so K_ITERS=2, BLOCK_M_SPLIT=64). The 5 N-chunks of B
+# (lv, rv, lg, rg, og) are processed sequentially per pid_m, with one fp32
+# SMEM staging slab `[BM, hd]` used to spill `lv` until its partner `lg`
+# completes WGMMA and the L-tile can be assembled. Same trick for (rv, rg).
+# `og` doesn't need spill — it's just sigmoid + store.
+#
+# SMEM budget at D=128 (per-CTA, naive):
+#   A_full       : NUM_MMA_GROUPS × 64 × 128 × 2  =  32 KiB
+#   B            : 3   × 128 ×  64 × 2            =  48 KiB
+#   staging      : 1   × 128 × 128 × 4            =  64 KiB   (single fp32 slab, reused
+#                                                              between (lv,lg) and (rv,rg))
+#   barriers/slop                                 ≈   1 KiB
+#   TOTAL                                         ≈ 145 KiB  (cap = 232 KiB)
+# Actual SMEM after MLIR layout/swizzle padding ≈ 195 KiB — under cap.
+#
+# Register cost (per consumer warpgroup): 1 active fp32 acc [64,128] = 32 KB
+# at any one time. Fits well under the ~64 KB consumer regfile (C3).
+#
+# C2 compliance: all barrier ops live at the top level of the WG body — no
+# `tl.if` gating. The 5 N-chunks are unrolled by `tl.static_range`.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def matmul_kernel_tlx_ws_epi_d128(
+    a_ptr,  # bf16 [T, K]                input (post-LN-cast x_flat)
+    b_ptr,  # bf16 [K, 5*hd]              fat weight (B_g)
+    mask_ptr,  # fp32 [T]
+    rstd_ptr,  # fp32 [T]
+    mean_ptr,  # fp32 [T]
+    s1_ptr,  # fp32 [5*hd]
+    s2_ptr,  # fp32 [5*hd]
+    L_ptr,  # bf16 [B*hd, N2]   (= [B*hd, T_per_batch])
+    R_ptr,  # bf16 [B*hd, N2]
+    og_ptr,  # fp32 [T, hd]
+    T,
+    Bbatch,
+    N2,
+    K: tl.constexpr,  # = dim, hard-coded 128
+    HD: tl.constexpr,  # = hd, hard-coded 128
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    NUM_MMA_GROUPS: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    BLOCK_M_SPLIT: tl.constexpr = BM // NUM_MMA_GROUPS
+    K_ITERS: tl.constexpr = K // BK
+    NUM_CHUNKS: tl.constexpr = 5  # lv, rv, lg, rg, og
+
+    # ---- TMA descriptors --------------------------------------------------
+    # A: load each consumer's half-row strip in ONE TMA op (BLOCK_M_SPLIT × K).
+    # This keeps the wire count low (2 loads per pid_m) and lines up with
+    # `a_full` being indexed per-half via `local_view(a_full, replica_id)`.
+    a_desc = tlx.make_tensor_descriptor(
+        desc_ptr=None,
+        base=a_ptr,
+        shape=[T, K],
+        strides=[K, 1],
+        block_shape=[BLOCK_M_SPLIT, K],
+    )
+    # B is [K, 5*hd] row-major; we load BK × BN slabs per (k, n_chunk).
+    b_desc = tlx.make_tensor_descriptor(
+        desc_ptr=None,
+        base=b_ptr,
+        shape=[K, NUM_CHUNKS * HD],
+        strides=[NUM_CHUNKS * HD, 1],
+        block_shape=[BK, BN],
+    )
+
+    # ---- SMEM allocations -------------------------------------------------
+    # A is loaded ONCE per pid_m (shared across all 5 N-chunks × K_ITERS).
+    # Single-buffered: NS_A=1.
+    a_full = tlx.local_alloc((BLOCK_M_SPLIT, K), tlx.dtype_of(a_ptr), NUM_MMA_GROUPS)
+    # B is pipelined with NUM_STAGES across (n_chunk, k) load iterations.
+    # We need NUM_STAGES because the producer wants to issue ahead of the
+    # consumer; every (n_chunk × k) iteration consumes one B buffer.
+    b = tlx.local_alloc((BK, BN), tlx.dtype_of(b_ptr), NUM_STAGES)
+    # fp32 staging for spilling `lv` / `rv` across the WGMMA between (lv,lg)
+    # and (rv,rg). Shared across both consumer WGs (each writes its own
+    # [BLOCK_M_SPLIT, HD] half via local_slice). Single slab — chunk order
+    # is lv → lg → write L → rv → rg → write R → og, so the slab is written
+    # before each store and consumed before the next overwrite.
+    staging = tlx.local_alloc((BM, HD), tl.float32, 1)
+
+    # ---- Barriers ---------------------------------------------------------
+    # A barriers: one per (consumer-half) per tile. Producer arrives after
+    # loading both halves; consumer arrives after finishing all 5 chunks.
+    bars_empty_a = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=1)
+    bars_full_a = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=1)
+    # B barriers: NUM_STAGES across (n_chunk × k) iterations. Each B buffer
+    # is consumed by both consumer WGs (arrive_count=NUM_MMA_GROUPS for empty).
+    bars_empty_b = tlx.alloc_barriers(
+        num_barriers=NUM_STAGES, arrive_count=NUM_MMA_GROUPS
+    )
+    bars_full_b = tlx.alloc_barriers(num_barriers=NUM_STAGES, arrive_count=1)
+    # Staging barriers: gates `lv` written by consumer A from being read again
+    # by the same consumer after the partner `lg` WGMMA finishes. We use a
+    # plain `tlx.fence("async_shared")` instead — no cross-WG sync needed
+    # here since each consumer reads/writes ONLY its own slab of `staging`.
+
+    num_pid_m = tl.cdiv(T, BM)
+
+    with tlx.async_tasks():
+        # =================================================================
+        # Producer warpgroup — TMA loads of A (once per pid_m) and B
+        # (NUM_CHUNKS × K_ITERS times per pid_m).
+        # =================================================================
+        with tlx.async_task("default"):
+            sm_id = tl.program_id(axis=0)
+            tile_id = sm_id
+            b_accum_cnt = 0
+            while tile_id < num_pid_m:
+                pid_m = tile_id
+                offset_am = pid_m * BM
+
+                # ---- A: load both consumer halves once -------------------
+                empty_a0 = tlx.local_view(bars_empty_a, 0)
+                full_a0 = tlx.local_view(bars_full_a, 0)
+                tlx.barrier_wait(bar=empty_a0, phase=(tile_id // NUM_SMS) & 1 ^ 1)
+                tlx.barrier_expect_bytes(
+                    full_a0,
+                    BLOCK_M_SPLIT * K * tlx.size_of(tlx.dtype_of(a_ptr)),
+                )
+                data_a0 = tlx.local_view(a_full, 0)
+                tlx.async_descriptor_load(a_desc, data_a0, [offset_am, 0], full_a0)
+
+                empty_a1 = tlx.local_view(bars_empty_a, 1)
+                full_a1 = tlx.local_view(bars_full_a, 1)
+                tlx.barrier_wait(bar=empty_a1, phase=(tile_id // NUM_SMS) & 1 ^ 1)
+                tlx.barrier_expect_bytes(
+                    full_a1,
+                    BLOCK_M_SPLIT * K * tlx.size_of(tlx.dtype_of(a_ptr)),
+                )
+                data_a1 = tlx.local_view(a_full, 1)
+                tlx.async_descriptor_load(
+                    a_desc, data_a1, [offset_am + BLOCK_M_SPLIT, 0], full_a1
+                )
+
+                # ---- B: 5 N-chunks × K_ITERS K-tiles --------------------
+                # B-side memory order is [lv, rv, lg, rg, og] (positions 0..4).
+                # Consumer processes in order [lv, lg, rv, rg, og] so it can
+                # spill lv → load lg → store L (then re-use the staging slab
+                # for rv→rg). Producer must match: emit chunks in the order
+                # the consumer expects so each B buffer arrives just-in-time.
+                # Position map: [lv=0, lg=2, rv=1, rg=3, og=4]
+                for nc_pos in tl.static_range(NUM_CHUNKS):
+                    if nc_pos == 0:
+                        nc_b = 0  # lv
+                    elif nc_pos == 1:
+                        nc_b = 2  # lg
+                    elif nc_pos == 2:
+                        nc_b = 1  # rv
+                    elif nc_pos == 3:
+                        nc_b = 3  # rg
+                    else:
+                        nc_b = 4  # og
+                    for k in tl.static_range(K_ITERS):
+                        buf, p = _get_bufidx_phase(b_accum_cnt, NUM_STAGES)
+                        empty_b = tlx.local_view(bars_empty_b, buf)
+                        full_b = tlx.local_view(bars_full_b, buf)
+                        tlx.barrier_wait(bar=empty_b, phase=p ^ 1)
+                        tlx.barrier_expect_bytes(
+                            full_b, BN * BK * tlx.size_of(tlx.dtype_of(b_ptr))
+                        )
+                        data_b = tlx.local_view(b, buf)
+                        tlx.async_descriptor_load(
+                            b_desc,
+                            data_b,
+                            [k * BK, nc_b * HD],
+                            full_b,
+                        )
+                        b_accum_cnt += 1
+
+                tile_id += NUM_SMS
+
+        # =================================================================
+        # Consumer warpgroup — replicate=2; each WG handles half the M-rows
+        # and runs all 5 WGMMAs sequentially, applying the gate-LN epilogue.
+        # =================================================================
+        with tlx.async_task(num_warps=4, replicate=2):
+            sm_id = tl.program_id(axis=0)
+            tile_id = sm_id
+            b_accum_cnt = 0
+
+            # Per-CTA constants for indexing
+            tiles_per_batch = N2 // BM  # = T_per_batch / BM = N2 / 128
+
+            # Affine tables: load once per WG; constant across pid_m.
+            d = tl.arange(0, HD)
+            s1_l = tl.load(s1_ptr + d)
+            s2_l = tl.load(s2_ptr + d)
+            s1_r = tl.load(s1_ptr + d + HD)
+            s2_r = tl.load(s2_ptr + d + HD)
+            s1_lg = tl.load(s1_ptr + d + 2 * HD)
+            s2_lg = tl.load(s2_ptr + d + 2 * HD)
+            s1_rg = tl.load(s1_ptr + d + 3 * HD)
+            s2_rg = tl.load(s2_ptr + d + 3 * HD)
+            s1_og = tl.load(s1_ptr + d + 4 * HD)
+            s2_og = tl.load(s2_ptr + d + 4 * HD)
+
+            while tile_id < num_pid_m:
+                pid_m = tile_id
+
+                # Wait for our half of A
+                full_a = tlx.local_view(bars_full_a, tlx.async_task_replica_id())
+                tlx.barrier_wait(bar=full_a, phase=(tile_id // NUM_SMS) & 1)
+                a_my_half = tlx.local_view(a_full, tlx.async_task_replica_id())
+
+                # Row offset inside the global T axis for THIS consumer's slab
+                offset_am = pid_m * BM + BLOCK_M_SPLIT * tlx.async_task_replica_id()
+                # (b, ij) decomposition for the rows owned by this consumer.
+                # All rows in our [BLOCK_M_SPLIT] slab share the same `b`
+                # (since BLOCK_M_SPLIT=64 ≤ N2/(B*N) for all D=128 shapes —
+                #  smallest N=256 → N²=65536 ≫ 64; B*N² always divides cleanly).
+                # We tolerate cross-batch slabs gracefully via per-row `b` calc
+                # using BLOCK_M_SPLIT vector arithmetic below.
+                row = offset_am + tl.arange(0, BLOCK_M_SPLIT)
+                row_b = row // N2
+                row_ij = row % N2
+
+                # Gate-LN per-row constants for the BLOCK_M_SPLIT rows owned.
+                rs = tl.load(rstd_ptr + row)
+                mu = tl.load(mean_ptr + row)
+                msk = tl.load(mask_ptr + row)
+                # Reshape for broadcast against [BLOCK_M_SPLIT, HD]
+                rs_b = rs[:, None]
+                mu_b = mu[:, None]
+                msk_b = msk[:, None]
+
+                # ----- Helper for one chunk's WGMMA over the K-tiles -----
+                # (Manually inlined below so each chunk's epilogue can do
+                # different work without an outer per-chunk dispatch.)
+
+                # B-side memory layout is [lv=0, rv=1, lg=2, rg=3, og=4].
+                # Per-pid_m chunk processing order (matches producer reorder):
+                #   pos 0  WGMMA(B[lv]) → spill lv to staging
+                #   pos 1  WGMMA(B[lg]) → combine with lv → write L
+                #   pos 2  WGMMA(B[rv]) → spill rv to staging (re-use same slab)
+                #   pos 3  WGMMA(B[rg]) → combine with rv → write R
+                #   pos 4  WGMMA(B[og]) → sigmoid + write og
+                # Only ONE fp32 acc is live per consumer WG at any time,
+                # registers ≈ 32 KB (well under C3 64-KB limit).
+
+                stg = tlx.local_view(staging, 0)
+                stg_my = tlx.local_slice(
+                    stg,
+                    [BLOCK_M_SPLIT * tlx.async_task_replica_id(), 0],
+                    [BLOCK_M_SPLIT, HD],
+                )
+                # L_addr is identical for L and R writes (re-use)
+                L_addr = (row_b[:, None] * HD + d[None, :]) * N2 + row_ij[:, None]
+
+                # ===== Pos 0: lv =========================================
+                acc = tl.zeros([BLOCK_M_SPLIT, BN], dtype=tl.float32)
+                for k in tl.static_range(K_ITERS):
+                    buf, p = _get_bufidx_phase(b_accum_cnt, NUM_STAGES)
+                    full_b = tlx.local_view(bars_full_b, buf)
+                    tlx.barrier_wait(bar=full_b, phase=p)
+                    a_slice = tlx.local_slice(
+                        a_my_half, [0, k * BK], [BLOCK_M_SPLIT, BK]
+                    )
+                    data_b = tlx.local_view(b, buf)
+                    acc = tlx.async_dot(a_slice, data_b, acc)
+                    acc = tlx.async_dot_wait(tl.constexpr(0), acc)
+                    empty_b = tlx.local_view(bars_empty_b, buf)
+                    tlx.barrier_arrive(empty_b)
+                    b_accum_cnt += 1
+                tlx.local_store(stg_my, acc)
+                tlx.fence("async_shared")
+
+                # ===== Pos 1: lg → write L ===============================
+                acc = tl.zeros([BLOCK_M_SPLIT, BN], dtype=tl.float32)
+                for k in tl.static_range(K_ITERS):
+                    buf, p = _get_bufidx_phase(b_accum_cnt, NUM_STAGES)
+                    full_b = tlx.local_view(bars_full_b, buf)
+                    tlx.barrier_wait(bar=full_b, phase=p)
+                    a_slice = tlx.local_slice(
+                        a_my_half, [0, k * BK], [BLOCK_M_SPLIT, BK]
+                    )
+                    data_b = tlx.local_view(b, buf)
+                    acc = tlx.async_dot(a_slice, data_b, acc)
+                    acc = tlx.async_dot_wait(tl.constexpr(0), acc)
+                    empty_b = tlx.local_view(bars_empty_b, buf)
+                    tlx.barrier_arrive(empty_b)
+                    b_accum_cnt += 1
+                # LN-correction (matches fused_gate_ln_bmm_layout):
+                #   value = rs * (raw - mu * s1) + s2
+                lv = tlx.local_load(stg_my)
+                lv_n = rs_b * (lv - mu_b * s1_l[None, :]) + s2_l[None, :]
+                lg_s = tl.sigmoid(rs_b * (acc - mu_b * s1_lg[None, :]) + s2_lg[None, :])
+                L_tile = lv_n * lg_s * msk_b
+                # Auto-narrows fp32 → bf16 because L_ptr is bf16.
+                tl.store(L_ptr + L_addr, L_tile)
+
+                # ===== Pos 2: rv → spill =================================
+                acc = tl.zeros([BLOCK_M_SPLIT, BN], dtype=tl.float32)
+                for k in tl.static_range(K_ITERS):
+                    buf, p = _get_bufidx_phase(b_accum_cnt, NUM_STAGES)
+                    full_b = tlx.local_view(bars_full_b, buf)
+                    tlx.barrier_wait(bar=full_b, phase=p)
+                    a_slice = tlx.local_slice(
+                        a_my_half, [0, k * BK], [BLOCK_M_SPLIT, BK]
+                    )
+                    data_b = tlx.local_view(b, buf)
+                    acc = tlx.async_dot(a_slice, data_b, acc)
+                    acc = tlx.async_dot_wait(tl.constexpr(0), acc)
+                    empty_b = tlx.local_view(bars_empty_b, buf)
+                    tlx.barrier_arrive(empty_b)
+                    b_accum_cnt += 1
+                tlx.local_store(stg_my, acc)
+                tlx.fence("async_shared")
+
+                # ===== Pos 3: rg → write R ===============================
+                acc = tl.zeros([BLOCK_M_SPLIT, BN], dtype=tl.float32)
+                for k in tl.static_range(K_ITERS):
+                    buf, p = _get_bufidx_phase(b_accum_cnt, NUM_STAGES)
+                    full_b = tlx.local_view(bars_full_b, buf)
+                    tlx.barrier_wait(bar=full_b, phase=p)
+                    a_slice = tlx.local_slice(
+                        a_my_half, [0, k * BK], [BLOCK_M_SPLIT, BK]
+                    )
+                    data_b = tlx.local_view(b, buf)
+                    acc = tlx.async_dot(a_slice, data_b, acc)
+                    acc = tlx.async_dot_wait(tl.constexpr(0), acc)
+                    empty_b = tlx.local_view(bars_empty_b, buf)
+                    tlx.barrier_arrive(empty_b)
+                    b_accum_cnt += 1
+                rv = tlx.local_load(stg_my)
+                rv_n = rs_b * (rv - mu_b * s1_r[None, :]) + s2_r[None, :]
+                rg_s = tl.sigmoid(rs_b * (acc - mu_b * s1_rg[None, :]) + s2_rg[None, :])
+                R_tile = rv_n * rg_s * msk_b
+                tl.store(R_ptr + L_addr, R_tile)
+
+                # ===== Pos 4: og =========================================
+                acc = tl.zeros([BLOCK_M_SPLIT, BN], dtype=tl.float32)
+                for k in tl.static_range(K_ITERS):
+                    buf, p = _get_bufidx_phase(b_accum_cnt, NUM_STAGES)
+                    full_b = tlx.local_view(bars_full_b, buf)
+                    tlx.barrier_wait(bar=full_b, phase=p)
+                    a_slice = tlx.local_slice(
+                        a_my_half, [0, k * BK], [BLOCK_M_SPLIT, BK]
+                    )
+                    data_b = tlx.local_view(b, buf)
+                    acc = tlx.async_dot(a_slice, data_b, acc)
+                    acc = tlx.async_dot_wait(tl.constexpr(0), acc)
+                    empty_b = tlx.local_view(bars_empty_b, buf)
+                    tlx.barrier_arrive(empty_b)
+                    b_accum_cnt += 1
+                og_v = tl.sigmoid(rs_b * (acc - mu_b * s1_og[None, :]) + s2_og[None, :])
+                og_addr = row[:, None] * HD + d[None, :]
+                tl.store(og_ptr + og_addr, og_v)
+
+                # ---- Release A buffer (both consumer WGs arrive) ---------
+                empty_a = tlx.local_view(bars_empty_a, tlx.async_task_replica_id())
+                tlx.barrier_arrive(empty_a)
+
+                tile_id += NUM_SMS
+
+
+D128_FUSED_CONFIG = dict(
+    BM=128,
+    BN=128,
+    BK=64,
+    NUM_STAGES=3,
+    NUM_MMA_GROUPS=2,
+)
+
+
+def matmul_fused_d128(
+    x_flat,  # bf16 [T, K=128]
+    B_g,  # bf16 [K, 5*hd]
+    mask_flat,  # fp32 [T]
+    rstd,  # fp32 [T]
+    mean,  # fp32 [T]
+    s1,  # fp32 [5*hd]
+    s2,  # fp32 [5*hd]
+    Bbatch,
+    N2,
+    hd,
+):
+    """Single-kernel S1: matmul + gate-LN epilogue + bmm-friendly L/R store.
+
+    Returns (L_bf16[B*hd, N2], R_bf16[B*hd, N2], og_fp32[T, hd]).
+    """
+    T, K = x_flat.shape
+    assert K == 128 and hd == 128, f"D=128 only (got K={K}, hd={hd})"
+    assert x_flat.dtype == torch.bfloat16
+    assert B_g.shape == (K, 5 * hd) and B_g.dtype == torch.bfloat16
+    assert T == Bbatch * N2
+
+    L = torch.empty((Bbatch * hd, N2), device=x_flat.device, dtype=torch.bfloat16)
+    R = torch.empty((Bbatch * hd, N2), device=x_flat.device, dtype=torch.bfloat16)
+    og = torch.empty((T, hd), device=x_flat.device, dtype=torch.float32)
+
+    triton.set_allocator(_alloc_fn)
+    cfg = D128_FUSED_CONFIG
+    num_pid_m = triton.cdiv(T, cfg["BM"])
+    grid = (min(NUM_SMS, num_pid_m),)
+    matmul_kernel_tlx_ws_epi_d128[grid](
+        x_flat,
+        B_g,
+        mask_flat,
+        rstd,
+        mean,
+        s1,
+        s2,
+        L,
+        R,
+        og,
+        T,
+        Bbatch,
+        N2,
+        K=K,
+        HD=hd,
+        NUM_SMS=NUM_SMS,
+        num_stages=1,
+        num_warps=4,
+        **cfg,
+    )
+    return L, R, og
+
+
 def tlx_ws_bmm_fp32(L, R):
     """L, R: bf16 [B*hd, N, N]. Return fp32 [B*hd, N, N] = bmm(L, R^T).
 
@@ -2273,6 +2790,7 @@ def _prep_weights(W, dim, hd):
         ]
     )
     fp = tuple(fp_t.cpu().tolist())
+
     # Per chairman ruling, defense-in-depth: include shape/stride/dtype/version
     # so two tensors that share a one-sample fingerprint AND a data_ptr but
     # differ in shape/layout/dtype still miss the cache.
@@ -2353,7 +2871,14 @@ def custom_kernel(data: input_t) -> output_t:
     proj = tlx_ws_matmul_fixed(x_flat, B_g, out_dtype=torch.bfloat16)
 
     mask_flat = mask.reshape(T).float()
-    # Allocate L, R directly in bmm-friendly [B*hd, N^2] bf16 layout. The new
+    # iter24 ABORT: tried `matmul_fused_d128` (matmul + gate-LN epilogue in
+    # one TLX warp-spec kernel — see kernel def above). Compiled, passed T0,
+    # but +38–48% SLOWER on all D=128 shapes. The 5 sequential per-N-chunk
+    # WGMMA setup/teardown overhead (acc-zero + barrier-waits + epilogue
+    # store/spill/fence between chunks) dwarfs the saved `proj [T, 5*hd]`
+    # HBM intermediate. See PROGRESS.md iter24. Reverted dispatch; kept the
+    # kernel definition for future "interleaved-K" follow-up.
+    # Allocate L, R directly in bmm-friendly [B*hd, N^2] bf16 layout. The
     # `fused_gate_ln_bmm_layout` kernel does the LN/gate math AND transposes on
     # the way out — eliminates the [T, hd] lf/rf intermediate and the
     # `tr_fwd_pair` pass (~0.5 ms + 0.54 GB on shape 6).

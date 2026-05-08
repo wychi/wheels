@@ -201,3 +201,39 @@ Geo-mean speedup across 7 shapes: **2.04×**. All shapes pass `atol=2e-2` agains
 - **What might still work later:** any kernel that *fuses additional work* into the final linear (e.g., applying the to_out gate inside the matmul epilogue, or producing the [B, N, N, D] view directly) so the WGMMA pipeline isn't the bottleneck. iter25 (decomposed 2+2+1 fusion) may absorb this opportunity.
 - **Test infrastructure landed:** `check_leaderboard_seeds.py --tier T0|T1|T2|T3` (independently committed in main as `604287a`). Standalone bench/sweep helpers landed at `optimize/bench_final_linear.py` and `optimize/sweep_final_linear_cfg.py` for iter25 reuse.
 
+### iter24 — D=128 deep fusion (gate-LN epilogue) — **ABORT (kernel ~2× slower than 2-kernel baseline)**
+
+- **PLAN_v4 hypothesis:** iter16's epilogue-fold variant (matmul + gate-LN + transpose-on-store fused into one TLX warp-spec kernel) avoided the [T, 5*hd] proj intermediate (1.34 GB on shape 4). At D=128 the SMEM cap is non-binding (K_ITERS=2). Target +5–10% on the 4 D=128 shapes (0,1,3,4) ≈ +3% geo.
+- **Implementation:** `matmul_kernel_tlx_ws_epi_d128` + Python wrapper `matmul_fused_d128`, gated on `dim == 128 and hd == 128`. Producer warpgroup loads A `[BM=128, K=128]` once per pid_m + 5 N-chunks × K_ITERS=2 = 10 B-tiles per pid_m (NUM_STAGES=3, BN=BLOCK_M_SPLIT*2 = hd=128). Two consumer WGs (replicate=2) process N-chunks in order [lv → spill, lg → write L, rv → spill, rg → write R, og → write] with a single fp32 SMEM staging slab (128×128×4=64 KiB) reused between (lv,lg) and (rv,rg). Per-WG only ONE fp32 acc [64,128]=32 KiB live at a time (well under C3). Producer reorders B-side memory chunk emission to match consumer order so each B buffer arrives JIT.
+- **Wheel-API yak shave:** uTLX 0.1.0+gitcba4ef9a's shipped `tlx.local_slice` is broken — `mem_ops.py:368` calls `create_memdesc_subslice(handle, offset, shape)` (3 args) but the GluonOpBuilder binding expects `(result_type, source_value, offsets)` (3 args, different positions; the wrapper drops the result type and swaps `shape` for `offsets`). Same class as C1. Added a runtime monkey-patch `_install_local_slice_fix()` near the kernel imports that constructs the correct result memdesc type via `get_shared_mem_desc_ty(elem_ty, shape, layout, alloc_shape)` and re-extracts the source layout via `get_gluon_layout_from_memdesc → ._to_ir(builder)`. Patch decorated `@tl.builtin` so AST codegen routes through it. Verified `tlx_ws_matmul_fixed` / `bmm_kernel_tlx_ws` still compile (their existing `local_slice` call sites are inside dead `NUM_CTAS == 2` branches).
+- **SMEM (verified by MLIR `out_of_resource` probe):** with NUM_STAGES=3 and 1 staging slab, actual SMEM usage = ~195 KiB / 232 KiB cap. NUM_STAGES=2 first try went to 262 KiB, so I dropped staging from 2 slabs → 1 (reusing across `(lv,lg)` and `(rv,rg)`) and restored NUM_STAGES=3.
+- **Per-shape outcome (CUDA_VISIBLE_DEVICES=5, 20-iter warmup, 30-iter timing):**
+
+  | shape | dim | distribution | baseline (ms) | iter24 fused (ms) | delta |
+  |---|---|---|---|---|---|
+  | 0 | 128 | normal | 0.575 | 0.795 | **+38%** SLOWER |
+  | 1 | 128 | cauchy | 2.342 | 3.345 | **+43%** SLOWER |
+  | 3 | 128 | normal | 1.029 | 1.515 | **+47%** SLOWER |
+  | 4 | 128 | cauchy | 3.969 | 5.867 | **+48%** SLOWER |
+
+  D=384 shapes (2, 5, 6) untouched (dispatch only fires on `dim == 128`).
+- **Profile delta on shape 4:** torch profiler says new kernel `matmul_kernel_tlx_ws_epi_d128 = 3.873 ms/call` vs baseline (`matmul_kernel_tlx_ws = 0.897 ms/call` + `fused_gate_ln_bmm_layout = 1.153 ms/call` = 2.05 ms/call combined). The fused kernel is **1.9× slower** than the unfused 2-kernel sequence, the opposite of the predicted +5–10% improvement.
+- **Why it loses (root cause):** The 5 sequential per-N-chunk WGMMA launches inside one kernel each pay a full `acc = tl.zeros + K-loop barrier wait/arrive cycle + async_dot_wait + epilogue spill/fence/global-store` — total ~10 µs per chunk per pid_m × 5 chunks × 62 pid_m per SM = 3.1 ms. The ORIGINAL `matmul_kernel_tlx_ws` runs all 5 N-chunks as DIFFERENT TILE_IDs in the persistent loop, where the round-robin scheduler keeps the WGMMA pipeline tight (per-pid_m matmul time = 5.8 µs ≈ 0.58 µs / wgmma; mine is ~2.5 µs / wgmma). The `proj` HBM bandwidth saved (~1.3 GB / 3 TB/s ≈ 430 µs) is only about 22% of the per-chunk overhead added, so net loss.
+- **Numerics correctness (proves the fusion math is right; perf is the only blocker):** T0 PASS (max_err 0.01754); T2 with the fused path enabled mid-iter PASS (0/96 = 0.00%); the bf16 cascade is unchanged because L/R writes auto-narrow from fp32 acc → bf16 buffer and og keeps fp32. So the kernel is *correct*, just *slow*.
+- **Verdict (PLAN_v4 §4 abort criterion):** ABORT — "D=128 shapes ≥ 1.05× current required for accept; we got 0.7×." Reverted the dispatch site so D=128 keeps the (matmul + fused_gate_ln_bmm_layout) sequence. Kept the kernel definition + `matmul_fused_d128` wrapper + the `_install_local_slice_fix` patch in source for the next attempt; the local-slice patch is generally useful and unblocks future iterations that need multi-dim SMEM slicing.
+- **Post-revert validation:** Bench numbers within noise of pre-iter baseline:
+
+  | shape | pre-iter24 (ms) | post-revert (ms) |
+  |---|---|---|
+  | 0 | 0.575 | 0.567 |
+  | 1 | 2.342 | 2.350 |
+  | 2 | 0.731 | 0.737 |
+  | 3 | 1.029 | 1.030 |
+  | 4 | 3.969 | 3.988 |
+  | 5 | 3.026 | 3.047 |
+  | 6 | 5.356 | 5.375 |
+
+  T2 0/96 = 0.00%; max_err 0.02204 (shape 0).
+- **What needs to happen for the fusion to win:** keep all 5 N-chunk accumulators alive across a tight K-iter loop (so the WGMMA pipeline is fed continuously). That requires either (a) 5 fp32 accs per consumer WG simultaneously — iter18's 80-KB cliff at BM=64 — or (b) a tilewise interleaved-K design where each k-iter cycles through all 5 N-chunks before advancing k, with B-loads pipelined across chunks. Option (b) is essentially a partial monolithic S1 and is closer in spirit to iter18 Phase B than iter16. Out of scope for iter24.
+- **Time invested:** ~3 h (1 h kernel design + 1.5 h debugging local_slice wheel-API hole + 30 min profiling/abort).
+
