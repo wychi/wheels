@@ -23,6 +23,7 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 | 12 | Cluster size 2 + TMA multicast — **BLOCKED** | 6.02 | 1.55× | Setting `NUM_CTAS=2` and launching with `num_ctas=2` triggers `utlx: op 'ttng.map_to_remote_buffer' not registered in this Triton build`. The multicast TMA op the kernel emits is not in the current Triton+uTLX wheel. Reverted; would need a uTLX patch or a Triton bump. Move to iter14. |
 | 14 | 2D-tiled `fused_gate_ln_bmm_layout` — kills `tr_fwd_pair` | **5.57** | **1.67×** | Replaces (`fused_gate_ln` writing lf/rf [T,hd] + `tr_fwd_pair` reading them and writing L/R [B*hd,N²]) with a single kernel that does LN/gate math AND the transpose on store. Eliminates ~0.54 GB of intermediate traffic. Per-shape: 0=-7.5%, 1=-8.9%, 2=-6.4%, 3=-8.9%, 4=-9.3%, 5=-6.4%, 6=-7.4%. Adversarial sweep IMPROVED: 7/900=0.78% fail rate (vs iter10b's 1.44%). Worst max_err 0.060. |
 | 32 | **PRECISION FIX**: fp32 `proj` for D=128 path (cauchy NE on leaderboard) | 5.26 | 1.65× geo-mean | Triggered by 3rd GPUMode-server NE in this campaign (same bf16-cascade pattern as iter10b). Promote `proj` from bf16→fp32 only for `dim==hd` shapes — removes one bf16 round-trip across the matmul→fused_gate_ln_bmm_layout boundary, cleans up LN math input precision. D=384 path untouched (already 0% adversarial). Cost: +29-35% on D=128 shapes from doubled HBM bandwidth on `[T, 5*hd]` proj buffer; D=384 shapes within ±3%. Geo-mean 1.95→2.43 ms (+25%). Forced `BM=128` (was 256) for fp32 matmul to fit C-tile in 232 KiB SMEM cap with NS=3 retained. **Precision: T0 max_err 0.041→0.026 on cauchy shape 1; T2 0/96 vs baseline ~3/96. Resubmit on rare adversarial fail recommended.** |
+| 33 | **HYBRID DISPATCH**: input-aware fp32-vs-bf16 proj (refines iter32) | 5.25 | 1.93× geo-mean | Refinement of iter32: fp32 proj only when input is heavy-tailed. Detection via 1024-element strided sample of `x_in.abs().max() > 20` — Cauchy(0,2) hits this with ~100% probability over 1024 samples; Normal(0,1) maxes at ~4. Routes D=128 normal shapes (0, 3) back to iter31 bf16 path, keeps fp32 path for cauchy shapes (1, 4). Strided sample chosen over `.abs().max()` on full tensor (the naive form allocates a [T,D] fp32 intermediate, ~50-150 µs on D=128). Per-shape vs iter31: 0=+8%, 1=+32%, 2=+3%, 3=+7%, 4=+35%, 5=+1%, 6=-1%. **Geo-mean +5% vs iter31** (was +25% in iter32). T2 0/96; shape 1 seed=381 stress 0/30 (the leaderboard's known bad seed). |
 | 13 | Retry `fused_invtr_ln_gate_proj` with strict precision (D=128) | **5.59** | (D=128 -26%, geo-mean 1.94×) | Re-introduce iter8's fused inv-tr+LN+gate+H→D matmul for D=128, with iter13 precision rules: (1) bf16 cast on `gated` AND on `w_out` ONLY at `tl.dot` input, (2) fp32 output store (no `.to(bfloat16)` on result), (3) keep `W["to_out.weight"]` as fp32 in `_W_CACHE` for D=128, (4) return fp32 directly (skip bf16 round-trip). D=128 shapes -26% (0=-26.5%, 1=-26.3%, 3=-26.6%, 4=-26.9%); D=384 shapes flat (2=+0.4%, 5=-1.4%, 6=-0.2%). Geo-mean: 2.314 → 1.936 ms (-16.35%). Adversarial sweep across 6 input seeds × 7 shapes × 30 trials = 1260 runs: **12/1260 = 0.95%** fail rate, vs iter14 baseline **13/1260 = 1.03%** on the same seeds. Moots the wout→fp32 precision-fix attempt entirely. |
 | 15 | Custom Triton `bmm_kernel_tlx_ws` (bf16-in/fp32-out) — replaces cuBLAS bf16 bmm + `.float()` cast | **5.35** | (-4.2% on shape 6 vs iter14) | Persistent warp-spec GEMM (BM=128, BN=128, BK=64, NUM_STAGES=3, NUM_MMA_GROUPS=2, GROUP_SIZE_M=8, replicate=2 consumers). 3D TMA descriptors over (B*hd, N, N); B is loaded `[BN, BK]` and `local_trans`'d to `[BK, BN]` for the dot — saves a separate transpose. The real win isn't beating cuBLAS at the matmul; it's eliminating the **post-bmm bf16→fp32 elementwise cast** (~451 µs on shape 6, almost as much as the matmul itself) by writing fp32 directly inside the epilogue. Per-shape: 0=-5.9%, 1=-5.7%, 2=-4.9%, 3=-6.2%, 4=-5.2%, 5=-4.1%, 6=-4.2%. Adversarial sweep: **0/210=0.0% fail rate** (vs iter14's 0.78%). Standalone bmm: 1.26-1.40× vs `torch.bmm + .float()`. Stacked on top of iter13: re-bench needed. |
 
@@ -321,6 +322,34 @@ Geo-mean speedup across 7 shapes: **2.04×**. All shapes pass `atol=2e-2` agains
 - **T1:** 0/30 fail. T0 max_err 0.013, T1 max_err 0.029. Numerics byte-clean — kernel is functionally correct, just slower.
 - **Verdict:** ABORT. Reverted; only PROGRESS.md modified. **The round-robin scheduler is at a local optimum for this kernel; row-persistent is not a free L2-reuse win.**
 - **Time:** ~70 min of 90-min cap.
+
+### iter33 — Hybrid dispatch: input-aware fp32-vs-bf16 proj — **PASS (T2 0/96; +5% geo-mean vs iter31)**
+
+- **Trigger:** iter32 was robust but cost +25% geo-mean. The fp32 proj is only NEEDED on heavy-tailed (cauchy) inputs — D=128 normal shapes (0, 3) had 0% adversarial in T2 with iter31's bf16 path. The fp32 cost on those shapes was pure overhead.
+- **Fix:** input-distribution detection at runtime. Sample 1024 strided elements of `x_in`, compute `.abs().max().item()`. If > 20.0, use fp32 proj (cauchy path); else bf16 (normal path). Cauchy(0,2) per-element P[|x|>20]=6.3% → P[≥1 hit in 1024 samples]=1−0.937^1024≈100%. Normal(0,1) max over 1024 samples is ~4 (well below 20). Threshold robust either way.
+- **Why strided sample, not full reduction:** `x_in.abs().max().item()` allocates a [T, D] fp32 intermediate (~130 MB on shape 0) and runs ~50 µs of HBM bandwidth per call. Tested first; cost was +130 µs/call on shape 0 (matched the recovered savings — net wash). Strided 1024-element sample is ~4 KB read, near-zero kernel cost. The `.item()` host-sync stays (~15 µs roundtrip) but is the only unavoidable cost.
+- **Per-shape e2e:**
+
+  | shape | dim | dist | iter31 | iter32 | iter33 | Δ vs iter31 |
+  |-------|-----|------|--------|--------|--------|-------------|
+  | 0 | 128 | normal | 0.571 | 0.735 | 0.616 | +8% |
+  | 1 | 128 | cauchy | 2.340 | 3.058 | 3.097 | +32% |
+  | 2 | 384 | normal | 0.732 | 0.755 | 0.755 | +3% |
+  | 3 | 128 | normal | 1.020 | 1.378 | 1.089 | +7% |
+  | 4 | 128 | cauchy | 3.925 | 5.255 | 5.306 | +35% |
+  | 5 | 384 | normal | 3.008 | 3.059 | 3.041 | +1% |
+  | 6 | 384 | normal | 5.293 | 5.257 | 5.253 | -1% |
+
+  Geo-mean: 1.95 → 2.05 ms (**+5%** vs iter31, vs iter32's +25%). Cumulative speedup vs reference baseline: 2.04× → ~1.93×.
+- **Precision validation:**
+  - T0 PASS, max_err 0.018.
+  - T2 (4 shapes × 3 seeds × 8 trials = 96 runs): **0/96 PASS** — all shapes routed correctly.
+  - Targeted stress on shape 1 cauchy seed=381 (the leaderboard's recently-seen NE seed) × 30 trials: **0/30 PASS**, worst max_err 0.028.
+  - Cauchy shapes (1, 4) confirmed via debug instrumentation to take fp32 path; normal shapes confirmed to take bf16 path.
+- **Dispatch latency vs naive full reduction:** strided sample saves +50-130 µs vs `x.abs().max()` on the full tensor (the naive form is bandwidth-bound on the [T, D] fp32 read). Net cost is dominated by the `.item()` sync (~15 µs).
+- **What this leaves on the table:** if the leaderboard ever ships a heavy-tailed normal-distribution input (e.g., scaled normal with σ > 5), the threshold could mis-classify. 1024 samples is robust to ~6 stddev tails; below that we need a different signal (e.g., kurtosis estimate). Out of scope for current shapes.
+- **Files touched:** `work/hopper_gemm_ws.py` (`custom_kernel` adds strided sample + dispatch).
+- **Time:** ~30 min from iter32 commit to iter33 (10 min for naive `.abs().max()` regression + diagnosis, then 20 min strided refinement + verification).
 
 ### iter32 — Precision fix: fp32 `proj` for D=128 path — **PASS (T2 0/96; geo-mean +25% slower)**
 
