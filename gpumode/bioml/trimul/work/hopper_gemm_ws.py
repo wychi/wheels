@@ -1310,6 +1310,64 @@ def _warp_specialize_codegen() -> None:
     TLX_WITH_DISPATCH._initialized = True
 
 
+@register("async_descriptor_load_eviction_policy", default=False)
+def _async_descriptor_load_eviction_policy() -> None:
+    """Plumb `eviction_policy` (and `cache_modifier`) through
+    `tlx.async_descriptor_load` to the gluon TMA-load binding.
+
+    Requires Triton wheel rebuilt with the gluon_ir.cc change exposing
+    `cache=` and `evict=` on `create_async_tma_copy_global_to_local`.
+    Without that the call raises 'incompatible function arguments'.
+    """
+    from utlx_plugin import mem_ops as _mem_ops
+    from utlx_plugin.mma_ops import require_nv_mma_shared_layout
+    import triton.language.core as _tl_core
+    import triton.language as _tl
+    from triton._C.libtriton import ir as _ir
+
+    _STR_TO_EVICT = {
+        "": _ir.EVICTION_POLICY.NORMAL,
+        "evict_first": _ir.EVICTION_POLICY.EVICT_FIRST,
+        "evict_last": _ir.EVICTION_POLICY.EVICT_LAST,
+    }
+    _STR_TO_CACHE = {
+        "": _ir.CACHE_MODIFIER.NONE,
+        ".ca": _ir.CACHE_MODIFIER.CA,
+        ".cg": _ir.CACHE_MODIFIER.CG,
+        ".cs": _ir.CACHE_MODIFIER.CS,
+        ".wb": _ir.CACHE_MODIFIER.WB,
+        ".wt": _ir.CACHE_MODIFIER.WT,
+    }
+
+    @_tl_core.builtin
+    def _patched(
+        desc, result, offsets, barrier, pred=None,
+        cache_modifier="", eviction_policy="",
+        multicast_targets=None, _semantic=None,
+    ):
+        if multicast_targets is None:
+            multicast_targets = []
+        eviction_policy = _tl._unwrap_if_constexpr(eviction_policy)
+        cache_modifier = _tl._unwrap_if_constexpr(cache_modifier)
+        evict = _STR_TO_EVICT[eviction_policy]
+        cache = _STR_TO_CACHE[cache_modifier]
+        result_handle = require_nv_mma_shared_layout(result, True, _semantic.builder)
+        offsets_ir = _semantic._convert_to_ir_values(offsets, require_i64=False)
+        if pred is None:
+            pred_handle = _semantic.builder.get_int1(True)
+        else:
+            pred_handle = pred.handle
+        multicast = len(multicast_targets) > 0
+        _semantic.builder.create_async_tma_copy_global_to_local(
+            desc.handle, offsets_ir, barrier.handle, result_handle, pred_handle,
+            multicast, None, cache, evict,
+        )
+
+    _mem_ops.async_descriptor_load = _patched
+    import utlx_plugin as _tlx
+    _tlx.async_descriptor_load = _patched
+
+
 _install_custom_deps(
     "https://github.com/wychi/wheels/releases/download/triton-3.7.0-7cff1f27/triton-3.7.0+git7cff1f27-cp313-cp313-linux_x86_64.whl",
     "https://github.com/wychi/wheels/releases/download/utlx-0.1.0-cba4ef9a/utlx-0.1.0+gitcba4ef9a-cp313-cp313-linux_x86_64.whl",

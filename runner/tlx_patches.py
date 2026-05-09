@@ -1168,3 +1168,240 @@ def _warp_specialize_codegen() -> None:
     TLX_WITH_DISPATCH[_tlx_extra.async_tasks] = _patched
     TLX_WITH_DISPATCH[_tlx_extra.async_task] = _ucg.visit_withAsyncTask
     TLX_WITH_DISPATCH._initialized = True
+
+
+@register("local_slice_fix")
+def _local_slice_fix() -> None:
+    """Fix `utlx_plugin.mem_ops.local_slice` for shared-memory buffers.
+
+    The shipped wheel's `local_slice` calls
+    `builder.create_memdesc_subslice(buffer.handle, offset, shape)` — a
+    3-arg call matching an old binding. The current C++ binding is
+    `(result_type: ir.type, source_value: ir.value, offsets: list)` —
+    the result memdesc type comes FIRST. Calling without it raises
+    "incompatible function arguments" at compile time and blocks any
+    kernel that needs to slice an SMEM buffer along multiple dims
+    (iter24's failed gate-LN epilogue, iter25's failed 2+2+1 fusion).
+
+    The canonical pattern lives in `triton.experimental.gluon.language.
+    _semantic.GluonSemantic.memdesc_slice`: build a new memdesc type with
+    the slice shape (same dtype, num, storage, layout), get its IR via
+    `to_ir(builder)`, then pass `(ty.to_ir, source.handle, offsets)`.
+    `buffered_tensor_type.to_ir` already routes SMEM through
+    `get_shared_mem_desc_ty`, so we reuse it.
+
+    The TMEM branch of `local_slice` (which forwards to `subslice` ->
+    `create_tmem_subslice`) is left untouched — different binding.
+
+    Retire when: uTLX's `mem_ops.local_slice` is updated to construct
+    the result memdesc type and pass it as the first arg to
+    `create_memdesc_subslice`. (utlx-py — Python-only fix in
+    `mem_ops.py`.)
+    """
+    from utlx_plugin import mem_ops as _mem_ops
+    from utlx_plugin.types import buffered_tensor, buffered_tensor_type, storage_kind
+    import triton.language.core as _tl_core
+
+    @_tl_core.builtin
+    def _local_slice_patched(buffer, offset, shape, _semantic=None):
+        if buffer.type.storage == storage_kind.tmem:
+            # Defer to original tmem handling.
+            assert len(offset) == 2 and len(shape) == 2
+            assert offset[0] == 0
+            assert shape[0] == buffer.type.shape[0]
+            return _mem_ops.subslice(buffer, offset[1], shape[1], _semantic=_semantic)
+
+        # SMEM path — build the result memdesc type and call the binding
+        # with `(type, value, offsets)`.
+        slice_ty = buffered_tensor_type(
+            buffer.type.element_ty,
+            list(shape),
+            buffer.type.num,
+            buffer.type.storage,
+            buffer.type.layout,
+        )
+        builder = _semantic.builder
+        slice_handle = builder.create_memdesc_subslice(
+            slice_ty.to_ir(builder), buffer.handle, offset
+        )
+        return buffered_tensor(
+            slice_handle,
+            buffer.type.element_ty,
+            list(shape),
+            buffer.type.num,
+            buffer.type.storage,
+            buffer.type.layout,
+        )
+
+    _mem_ops.local_slice = _local_slice_patched
+
+    # tlx namespace re-exports the names; refresh the bound name.
+    import utlx_plugin as _tlx
+    _tlx.local_slice = _local_slice_patched
+
+
+@register("nv_mma_shared_layout_to_ir_fix")
+def _nv_mma_shared_layout_to_ir_fix() -> None:
+    """Fix `nv_mma_shared_layout_encoding.to_ir` for the new GluonOpBuilder.
+
+    The shipped wheel's `nv_mma_shared_layout_encoding.to_ir` calls
+    `builder.make_nv_mma_shared_encoding_attr(shape, order, elem, ...)`
+    — a stale builder method that doesn't exist on `GluonOpBuilder`.
+    The current method is `get_nvmma_shared_layout(swizzle_bw,
+    elem_bw, transposed, fp4_padded, cga_layout, rank)` (different
+    signature, different name).
+
+    This patch overrides `to_ir` to map utlx's per-dim CTA fields
+    onto gluon's `cga_layout` representation and computes the swizzle
+    byte-width from the layout's `shape`+`elemType`, mirroring
+    `NVMMASharedLayout.get_default_for`. Surfaces when
+    `local_slice` (or any code path that re-emits the layout type)
+    walks through the layout's `to_ir`.
+
+    Retire when: uTLX's `types.nv_mma_shared_layout_encoding.to_ir`
+    is updated to call `get_nvmma_shared_layout` directly.
+    """
+    from utlx_plugin.types import nv_mma_shared_layout_encoding
+
+    def _swizzle_byte_width(shape, element_bitwidth):
+        """Same selection logic as NVMMASharedLayout.get_default_for."""
+        contig_dim_bytes = shape[-1] * element_bitwidth // 8
+        if contig_dim_bytes >= 128 and contig_dim_bytes % 128 == 0:
+            sw = 128
+        elif contig_dim_bytes >= 64 and contig_dim_bytes % 64 == 0:
+            sw = 64
+        elif contig_dim_bytes >= 32 and contig_dim_bytes % 32 == 0:
+            sw = 32
+        else:
+            sw = 0
+        flatten_outer = 1
+        for s in shape[:-1]:
+            flatten_outer *= s
+        if len(shape) < 2 or flatten_outer < 8:
+            sw = 0
+        return sw
+
+    def _is_natural_order(order):
+        """True when order is [rank-1, rank-2, ..., 0] (default, non-transposed)."""
+        return list(order) == list(reversed(range(len(order))))
+
+    def _patched_to_ir(self, builder):
+        element_bitwidth = self.elemType.primitive_bitwidth
+        rank = len(self.shape)
+        swizzle_bw = (
+            _swizzle_byte_width(self.shape, element_bitwidth)
+            if self.swizzled else 0
+        )
+        transposed = not _is_natural_order(self.order)
+        # utlx tracks numCTAsPerCGA/numCTASplit/numCTAOrder per dim. For the
+        # default single-CTA case (all 1s), gluon's cga_layout is just []
+        # ('no CGA tiling'). Non-default CGA layouts need explicit basis
+        # vectors — fall back to empty for now and assert it's the default
+        # case so we surface unsupported configurations rather than silently
+        # mis-emit.
+        is_default_cta = (
+            list(self.numCTAsPerCGA) == [1] * rank
+            and list(self.numCTASplit) == [1] * rank
+        )
+        if not is_default_cta:
+            raise NotImplementedError(
+                "nv_mma_shared_layout_to_ir_fix: non-default CTA layout "
+                f"not yet mapped to gluon cga_layout (got per-CGA="
+                f"{self.numCTAsPerCGA}, split={self.numCTASplit})."
+            )
+        cga_layout = []
+        return builder.get_nvmma_shared_layout(
+            swizzle_bw,
+            element_bitwidth,
+            transposed,
+            bool(self.fp4Padded),
+            cga_layout,
+            rank,
+        )
+
+    nv_mma_shared_layout_encoding.to_ir = _patched_to_ir
+
+
+@register("async_descriptor_load_eviction_policy", default=False)
+def _async_descriptor_load_eviction_policy() -> None:
+    """Plumb `eviction_policy` (and `cache_modifier`) through
+    `tlx.async_descriptor_load` to the gluon TMA-load binding.
+
+    The shipped wheel's `async_descriptor_load` accepts the kwarg and
+    validates it but never forwards it to
+    `create_async_tma_copy_global_to_local`. Pre-fix, the binding had
+    no slot for it. After Triton rebuild that adds `cache=` and
+    `evict=` parameters to the binding, this patch updates the wrapper
+    to actually pass them.
+
+    Requires: Triton wheel rebuilt with the gluon_ir.cc change that
+    exposes `cache` and `evict` keyword args on
+    `create_async_tma_copy_global_to_local`. Without that, the call
+    raises 'incompatible function arguments'.
+
+    Retire when: uTLX's `mem_ops.async_descriptor_load` is updated to
+    pass the kwargs through, AND the binding accepts them.
+    """
+    from utlx_plugin import mem_ops as _mem_ops
+    from utlx_plugin.mma_ops import require_nv_mma_shared_layout
+    import triton.language.core as _tl_core
+    import triton.language as _tl
+    from triton._C.libtriton import ir as _ir
+
+    _STR_TO_EVICT = {
+        "": _ir.EVICTION_POLICY.NORMAL,
+        "evict_first": _ir.EVICTION_POLICY.EVICT_FIRST,
+        "evict_last": _ir.EVICTION_POLICY.EVICT_LAST,
+    }
+    _STR_TO_CACHE = {
+        "": _ir.CACHE_MODIFIER.NONE,
+        ".ca": _ir.CACHE_MODIFIER.CA,
+        ".cg": _ir.CACHE_MODIFIER.CG,
+        ".cs": _ir.CACHE_MODIFIER.CS,
+        ".wb": _ir.CACHE_MODIFIER.WB,
+        ".wt": _ir.CACHE_MODIFIER.WT,
+    }
+
+    @_tl_core.builtin
+    def _patched(
+        desc,
+        result,
+        offsets,
+        barrier,
+        pred=None,
+        cache_modifier="",
+        eviction_policy="",
+        multicast_targets=None,
+        _semantic=None,
+    ):
+        if multicast_targets is None:
+            multicast_targets = []
+        eviction_policy = _tl._unwrap_if_constexpr(eviction_policy)
+        cache_modifier = _tl._unwrap_if_constexpr(cache_modifier)
+        if eviction_policy not in _STR_TO_EVICT:
+            raise ValueError(
+                f"eviction_policy must be one of {list(_STR_TO_EVICT)}, "
+                f"got '{eviction_policy}'"
+            )
+        if cache_modifier not in _STR_TO_CACHE:
+            raise ValueError(
+                f"cache_modifier must be one of {list(_STR_TO_CACHE)}, "
+                f"got '{cache_modifier}'"
+            )
+        evict = _STR_TO_EVICT[eviction_policy]
+        cache = _STR_TO_CACHE[cache_modifier]
+        result_handle = require_nv_mma_shared_layout(result, True, _semantic.builder)
+        offsets_ir = _semantic._convert_to_ir_values(offsets, require_i64=False)
+        if pred is None:
+            pred_handle = _semantic.builder.get_int1(True)
+        else:
+            pred_handle = pred.handle
+        multicast = len(multicast_targets) > 0
+        _semantic.builder.create_async_tma_copy_global_to_local(
+            desc.handle, offsets_ir, barrier.handle, result_handle, pred_handle,
+            multicast, None, cache, evict,
+        )
+
+    _mem_ops.async_descriptor_load = _patched
+    import utlx_plugin as _tlx
+    _tlx.async_descriptor_load = _patched
