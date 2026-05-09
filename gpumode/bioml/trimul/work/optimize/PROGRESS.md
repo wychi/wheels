@@ -22,6 +22,7 @@ Source kernel: `work/hopper_gemm_ws.py`. Target shape: #6 (B=1, S=1024, D=384). 
 | 11 | TLX matmul tile/stage sweep — **NO WIN** | 5.97 | 1.62× | Tested 4 alternatives (BM256/NS4/MG1, BM128/NS4/MG2, BM256/NS2/MG2, BM128/NS5/MG2). All within ±1.5% of baseline; deeper-NS configs that needed BM=256 (256 KB) don't fit the 228 KB cap. Baseline already near local optimum for SMEM-constrained tiles. Matches iter10 NCU finding (matmul TC SoL stuck at 65%). Move to iter12. |
 | 12 | Cluster size 2 + TMA multicast — **BLOCKED** | 6.02 | 1.55× | Setting `NUM_CTAS=2` and launching with `num_ctas=2` triggers `utlx: op 'ttng.map_to_remote_buffer' not registered in this Triton build`. The multicast TMA op the kernel emits is not in the current Triton+uTLX wheel. Reverted; would need a uTLX patch or a Triton bump. Move to iter14. |
 | 14 | 2D-tiled `fused_gate_ln_bmm_layout` — kills `tr_fwd_pair` | **5.57** | **1.67×** | Replaces (`fused_gate_ln` writing lf/rf [T,hd] + `tr_fwd_pair` reading them and writing L/R [B*hd,N²]) with a single kernel that does LN/gate math AND the transpose on store. Eliminates ~0.54 GB of intermediate traffic. Per-shape: 0=-7.5%, 1=-8.9%, 2=-6.4%, 3=-8.9%, 4=-9.3%, 5=-6.4%, 6=-7.4%. Adversarial sweep IMPROVED: 7/900=0.78% fail rate (vs iter10b's 1.44%). Worst max_err 0.060. |
+| 32 | **PRECISION FIX**: fp32 `proj` for D=128 path (cauchy NE on leaderboard) | 5.26 | 1.65× geo-mean | Triggered by 3rd GPUMode-server NE in this campaign (same bf16-cascade pattern as iter10b). Promote `proj` from bf16→fp32 only for `dim==hd` shapes — removes one bf16 round-trip across the matmul→fused_gate_ln_bmm_layout boundary, cleans up LN math input precision. D=384 path untouched (already 0% adversarial). Cost: +29-35% on D=128 shapes from doubled HBM bandwidth on `[T, 5*hd]` proj buffer; D=384 shapes within ±3%. Geo-mean 1.95→2.43 ms (+25%). Forced `BM=128` (was 256) for fp32 matmul to fit C-tile in 232 KiB SMEM cap with NS=3 retained. **Precision: T0 max_err 0.041→0.026 on cauchy shape 1; T2 0/96 vs baseline ~3/96. Resubmit on rare adversarial fail recommended.** |
 | 13 | Retry `fused_invtr_ln_gate_proj` with strict precision (D=128) | **5.59** | (D=128 -26%, geo-mean 1.94×) | Re-introduce iter8's fused inv-tr+LN+gate+H→D matmul for D=128, with iter13 precision rules: (1) bf16 cast on `gated` AND on `w_out` ONLY at `tl.dot` input, (2) fp32 output store (no `.to(bfloat16)` on result), (3) keep `W["to_out.weight"]` as fp32 in `_W_CACHE` for D=128, (4) return fp32 directly (skip bf16 round-trip). D=128 shapes -26% (0=-26.5%, 1=-26.3%, 3=-26.6%, 4=-26.9%); D=384 shapes flat (2=+0.4%, 5=-1.4%, 6=-0.2%). Geo-mean: 2.314 → 1.936 ms (-16.35%). Adversarial sweep across 6 input seeds × 7 shapes × 30 trials = 1260 runs: **12/1260 = 0.95%** fail rate, vs iter14 baseline **13/1260 = 1.03%** on the same seeds. Moots the wout→fp32 precision-fix attempt entirely. |
 | 15 | Custom Triton `bmm_kernel_tlx_ws` (bf16-in/fp32-out) — replaces cuBLAS bf16 bmm + `.float()` cast | **5.35** | (-4.2% on shape 6 vs iter14) | Persistent warp-spec GEMM (BM=128, BN=128, BK=64, NUM_STAGES=3, NUM_MMA_GROUPS=2, GROUP_SIZE_M=8, replicate=2 consumers). 3D TMA descriptors over (B*hd, N, N); B is loaded `[BN, BK]` and `local_trans`'d to `[BK, BN]` for the dot — saves a separate transpose. The real win isn't beating cuBLAS at the matmul; it's eliminating the **post-bmm bf16→fp32 elementwise cast** (~451 µs on shape 6, almost as much as the matmul itself) by writing fp32 directly inside the epilogue. Per-shape: 0=-5.9%, 1=-5.7%, 2=-4.9%, 3=-6.2%, 4=-5.2%, 5=-4.1%, 6=-4.2%. Adversarial sweep: **0/210=0.0% fail rate** (vs iter14's 0.78%). Standalone bmm: 1.26-1.40× vs `torch.bmm + .float()`. Stacked on top of iter13: re-bench needed. |
 
@@ -320,6 +321,33 @@ Geo-mean speedup across 7 shapes: **2.04×**. All shapes pass `atol=2e-2` agains
 - **T1:** 0/30 fail. T0 max_err 0.013, T1 max_err 0.029. Numerics byte-clean — kernel is functionally correct, just slower.
 - **Verdict:** ABORT. Reverted; only PROGRESS.md modified. **The round-robin scheduler is at a local optimum for this kernel; row-persistent is not a free L2-reuse win.**
 - **Time:** ~70 min of 90-min cap.
+
+### iter32 — Precision fix: fp32 `proj` for D=128 path — **PASS (T2 0/96; geo-mean +25% slower)**
+
+- **Trigger:** 3rd GPUMode-server NE in this campaign. User reports same fingerprint as iter10b (bf16 cascade margin against `atol=2e-2 + rtol*|ref|`). Adversarial T3 partial on iter31 baseline confirmed 0.5–1% per-shape fail rate concentrated on D=128 cauchy shapes (shape 1: 2/210 = 0.95%, shape 4: in-flight when killed). D=384 shapes 0% adversarial in the same partial.
+- **Diagnosis:** D=128 path's bf16 cascade has 5 boundaries: `x→x_bf16` (matmul input, mandatory) → `proj` (matmul out, **removable**) → `L,R` (bmm input, mandatory) → `out_bmm` (already fp32 since iter10b) → `gated` (fp32, cast at `tl.dot` only). The `proj` round-trip is the only cheap removal — it's bf16 only by output convention.
+- **Fix:** `proj_dtype = torch.float32 if dim == hd else torch.bfloat16` at the matmul callsite; `tlx_ws_matmul_fixed` builds a per-call cfg copy and forces `BM=128` for the fp32 path so the doubled C-tile (128×128×4 = 64 KiB) fits the 232 KiB SMEM cap with NS=3 retained. `fused_gate_ln_bmm_layout` already casts loads to fp32 on entry — dtype-agnostic, no kernel change.
+- **Per-shape e2e (shape × ms, CUDA_VISIBLE_DEVICES=4, profile_e2e_all_shapes.py):**
+
+  | shape | dim | dist | iter31 | iter32 | Δ |
+  |-------|-----|------|--------|--------|---|
+  | 0 | 128 | normal | 0.571 | 0.735 | +29% |
+  | 1 | 128 | cauchy | 2.340 | 3.058 | +31% |
+  | 2 | 384 | normal | 0.732 | 0.755 | +3% |
+  | 3 | 128 | normal | 1.020 | 1.378 | +35% |
+  | 4 | 128 | cauchy | 3.925 | 5.255 | +34% |
+  | 5 | 384 | normal | 3.008 | 3.059 | +2% |
+  | 6 | 384 | normal | 5.293 | 5.257 | -1% |
+
+  Geo-mean: 1.95 → 2.43 ms (+25%). Cumulative speedup vs reference baseline: 2.04× → 1.65×.
+- **Precision:**
+  - T0 max_err shape 4 cauchy: 0.014 → **0.010**.
+  - T2 (4 shapes × 3 seeds × 8 trials = 96 runs): **0/96 = 0.00%** (was hitting 1-3 fails on cauchy shapes pre-fix). max_err shape 1 cauchy: 0.041 → **0.026**, shape 4 cauchy: 0.027 → **0.027**.
+- **Why it costs 25%:** `proj [T, 5*hd]` is the largest intermediate after the matmul. fp32 doubles the HBM round-trip — for shape 4 (T=1M, 5*hd=640): 1.34 GB (bf16) → 2.68 GB (fp32) write+read. At ~3 TB/s that's +900 µs, matching the +1.3 ms regression. The matmul itself is also slower with NS=3 retained but BM halved (128 vs 256) — more tiles for the same M means launch tail overhead is a larger fraction.
+- **Tried EPILOGUE_SUBTILE=True** to keep BM=256 + NS=3: codegen core-dumps in this Triton/uTLX wheel combination on the fp32-output path. Reverted; BM=128 was the next-cheapest fit.
+- **Verdict:** PASS on robustness gate. The +25% geo-mean is a real cost, but ships the cauchy adversarial failure rate from ~1% to ~0% across the most-failure-prone shapes. Stops the recurring leaderboard NE.
+- **Files touched:** `work/hopper_gemm_ws.py` (`tlx_ws_matmul_fixed` cfg copy + BM override; `custom_kernel` proj_dtype dispatch).
+- **Time:** ~30 min from user "C" to commit.
 
 ### iter31 — bmm tile-config sweep (B3) — **PASS (BK=64→128, NS=3→2, GSM=8→1; shape 6 −1.3%)**
 

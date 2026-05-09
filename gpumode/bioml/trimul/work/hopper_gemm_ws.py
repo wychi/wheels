@@ -1341,9 +1341,15 @@ def _async_descriptor_load_eviction_policy() -> None:
 
     @_tl_core.builtin
     def _patched(
-        desc, result, offsets, barrier, pred=None,
-        cache_modifier="", eviction_policy="",
-        multicast_targets=None, _semantic=None,
+        desc,
+        result,
+        offsets,
+        barrier,
+        pred=None,
+        cache_modifier="",
+        eviction_policy="",
+        multicast_targets=None,
+        _semantic=None,
     ):
         if multicast_targets is None:
             multicast_targets = []
@@ -1359,12 +1365,20 @@ def _async_descriptor_load_eviction_policy() -> None:
             pred_handle = pred.handle
         multicast = len(multicast_targets) > 0
         _semantic.builder.create_async_tma_copy_global_to_local(
-            desc.handle, offsets_ir, barrier.handle, result_handle, pred_handle,
-            multicast, None, cache, evict,
+            desc.handle,
+            offsets_ir,
+            barrier.handle,
+            result_handle,
+            pred_handle,
+            multicast,
+            None,
+            cache,
+            evict,
         )
 
     _mem_ops.async_descriptor_load = _patched
     import utlx_plugin as _tlx
+
     _tlx.async_descriptor_load = _patched
 
 
@@ -1768,7 +1782,13 @@ def tlx_ws_matmul_fixed(a, b, out_dtype=torch.bfloat16):
     M, N, K = a.shape[0], b.shape[1], a.shape[1]
     c = torch.empty((M, N), dtype=out_dtype, device=DEVICE)
     triton.set_allocator(_alloc_fn)
-    cfg = TLX_CONFIG
+    cfg = dict(TLX_CONFIG)
+    if out_dtype == torch.float32:
+        # fp32 C tile is 2× the SMEM of bf16. The shipped BM=256 BN=128 NS=3
+        # blows the 232 KiB cap with the wider epilogue. Halving BM (256→128)
+        # leaves NS=3 intact and the per-CTA tile shape stays square — the
+        # extra tile count saturates 132 SMs at every shape we ship.
+        cfg["BM"] = 128
     num_tiles = triton.cdiv(M, cfg["BM"]) * triton.cdiv(N, cfg["BN"])
     num_ctas = cfg["NUM_CTAS"]
     if num_ctas == 2:
@@ -2932,7 +2952,14 @@ def custom_kernel(data: input_t) -> output_t:
         )
 
     B_g, s1, s2, w_out = _prep_weights(W, dim, hd)
-    proj = tlx_ws_matmul_fixed(x_flat, B_g, out_dtype=torch.bfloat16)
+    # iter32 precision tighten: for D=128 (where adversarial fail rate
+    # concentrates — cauchy shapes 1, 4 hit 0.5-1%), keep `proj` in fp32 so the
+    # downstream LN math reads the matmul accumulator without a bf16 round-trip.
+    # D=384 already passes adversarial clean and the +HBM bandwidth (≈21% on
+    # shape 6) isn't worth it. fused_gate_ln_bmm_layout casts loads to fp32 on
+    # entry so it's dtype-agnostic.
+    proj_dtype = torch.float32 if dim == hd else torch.bfloat16
+    proj = tlx_ws_matmul_fixed(x_flat, B_g, out_dtype=proj_dtype)
 
     mask_flat = mask.reshape(T).float()
     # iter24 ABORT: tried `matmul_fused_d128` (matmul + gate-LN epilogue in
