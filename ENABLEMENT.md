@@ -399,6 +399,91 @@ notes pointing at this commit. The remaining 7 are still load-bearing.
 | `async_load_native`          | Still required       | Plugin's `utlx_async_load` op still has the `operandSegmentSizes` bug. |
 | `warp_specialize_codegen`    | Still required       | `visit_withAsyncTasks` still uses the stale `WarpSpecializeOp` shape. |
 
+### Follow-up: TMA `eviction_policy` plumbing (2026-05-08)
+
+Investigated the chain that blocked PLAN_v4 iter21 (L2 cache-residency
+hints on read-only TMA loads — see PROGRESS.md iter21). The wheel ships
+`tlx.async_descriptor_load(..., eviction_policy='evict_last')` accepting
+the kwarg but silently dropping it; uncovering this required four
+distinct fixes spanning two repos:
+
+1. **uTLX Python wrapper** (`mem_ops.async_descriptor_load`) — accepts
+   `cache_modifier` / `eviction_policy` strings, validates them, never
+   forwards. Bridged via runner-side patch
+   `async_descriptor_load_eviction_policy` (`utlx-py`, default=False;
+   becomes default=True only after the wrapper is fixed in-tree).
+2. **Triton C++ binding** (`python/src/gluon_ir.cc`,
+   `create_async_tma_copy_global_to_local`) — was a 7-arg signature
+   with no slot for cache/evict. Extended to a 9-arg form with
+   defaulted `cache=NONE` / `evict=NORMAL`. Backward-compatible.
+3. **Triton MLIR op** (`TTNG_AsyncTMACopyGlobalToLocalOp`) — already
+   carried `cache` and `evict` attributes via its `.td` definition;
+   no change needed.
+4. **Triton NVPTX lowering**
+   (`third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp`)
+   — `AsyncTMACopyGlobalToLocalOpConversion` had an early-return
+   `op.emitError("eviction policy not supported yet")`. Replaced with
+   a call into the existing `createCachePolicy` helper that emits
+   `createpolicy.fractional.L2::evict_<...>.b64` and threads the
+   resulting policy register into the `cp.async.bulk.tensor` PTX as
+   `.L2::cache_hint`. `computeCapability` plumbed through
+   `populateLoadStoreOpToLLVMPatterns`.
+
+**End-to-end status:** working. PTX dump on H100 shows
+`createpolicy.fractional.L2::evict_last.b64 $cp, 1.0;` followed by
+`cp.async.bulk.tensor.<rank>d.shared::cta.global.L2::cache_hint.mbarrier::complete_tx::bytes [...], $cp`.
+The Triton-side patches live on local branch `wychi/tma-eviction-policy`
+in `~/oss/triton` (commit `890498160`); they could land upstream as a
+small backend addition.
+
+**Performance verdict on the original target (trimul iter21):**
+**~0% e2e gain on the trimul matmul kernel** (shape 6 control 5.253 ms
+vs evict 5.273 ms, within bench noise). PLAN_v4's "+5-8% e2e" estimate
+was wrong: the matmul's `B_g` weight (~480 KB) is small enough that
+the round-robin scheduler already gets natural L2 reuse. The explicit
+`evict_last` hint codifies what was already happening rather than
+unlocking new behaviour. The iter21 lever is **DEAD as an optimization**
+even with the wheel/upstream fixes; logged here to prevent re-investigation.
+
+**Reclassification of the original ENABLEMENT.md `utlx-py` row for
+`eviction_policy`:** the *runtime* fix is `utlx-py` (1 wrapper
+function), but the underlying support requires `triton` (NVPTX backend
+addition). This is a `triton` cluster issue that masquerades as a
+`utlx-py` one. Future investigations of "uTLX wrapper accepts kwarg
+but silently drops it" should check whether the upstream Triton
+backend even implements the feature before committing to a uTLX patch.
+
+### Follow-up: `tlx.local_slice` C++ binding fix (2026-05-08, partial)
+
+While debugging the same iter21/iter24/iter25 surface, also investigated
+`tlx.local_slice` on shared memory. The wheel's wrapper at
+`utlx_plugin/mem_ops.py:355` calls
+`builder.create_memdesc_subslice(buffer.handle, offset, shape)` — a
+3-arg call matching an old binding. The current binding signature is
+`(result_type, source_value, offsets)` with the result memdesc type
+FIRST.
+
+Bridged via two runner-side patches (both `default=False`):
+- `local_slice_fix` — constructs the result `buffered_tensor_type` and
+  calls `to_ir(builder)` for the result type, mirroring gluon's
+  `memdesc_slice` reference impl.
+- `nv_mma_shared_layout_to_ir_fix` — required because the layout's
+  `to_ir` calls a stale `make_nv_mma_shared_encoding_attr` (also gone
+  from `GluonOpBuilder`). Patches it to use `get_nvmma_shared_layout`
+  with the correct 6-arg signature.
+
+**Status:** patches load and reach the binding cleanly, but `local_slice`
+on a buffer whose layout encodes the parent's shape (e.g., a slice on
+the contiguous dim with a swizzle that no longer fits the slice) hits
+the C++ verifier "block shape too small for swizzle byte size". A
+correct fix needs the slice path to derive a smaller-swizzle layout
+when slicing along the contiguous dim, or restrict slicing to outer
+dims. Outer-dim slicing was confirmed to work past the layout layer
+but ran into further tlx-API holes (`local_alloc(num=N)` adds a leading
+dim that breaks naive `local_store` of a `[BM, BK]` source — the wheel
+expects multi-buffer indexing patterns). Documented as TODO; no kernel
+work currently depends on it.
+
 ---
 
 ## Enablement Workflow
@@ -473,6 +558,9 @@ Highest leverage; smallest cost. Each retires one or more patches.
 | `wgmma_use_acc_default`        | `mma_ops.async_dot` should pass `_semantic.builder.get_int1(True)` for `useAcc` instead of `None`. ~5-line fix. |
 | `warp_specialize_codegen`      | Rewrite `compiler/code_generator.py:visit_withAsyncTasks` against the current `WarpSpecializeOp` IR shape (defaultRegion + partitionOpHolder + nested `WarpSpecializePartitionsOp` with `explicitCaptures`). |
 | `async_load_native` (option a) | Drop the custom `utlx_async_load` op; have `mem_ops.async_load` call `create_async_copy_global_to_local` + `create_async_commit_group` + `create_async_wait_group` directly. |
+| `async_descriptor_load_eviction_policy` | `mem_ops.async_descriptor_load` should pass `cache_modifier`/`eviction_policy` through to `create_async_tma_copy_global_to_local` instead of dropping them on the floor. ~10-line fix. **NOTE:** also requires the `triton` cluster fix below for the binding to even accept those kwargs and the lowering to emit them as PTX cache hints. Without that, this patch raises 'incompatible function arguments' at compile time. |
+| `local_slice_fix` (partial)    | `mem_ops.local_slice` (SMEM branch) should construct the result memdesc type explicitly (mirror `triton.experimental.gluon.language._semantic.GluonSemantic.memdesc_slice`) and call `create_memdesc_subslice(result_type, source_handle, offsets)` — current call uses the old 3-arg form `(handle, offset, shape)` and crashes the binding. **Caveat:** also depends on `nv_mma_shared_layout_encoding.to_ir` being fixed (see `nv_mma_shared_layout_to_ir_fix`), and slicing along the contiguous dim of an NVMMA-swizzled buffer hits a verifier error — restrict to outer-dim slicing or derive a compatible swizzle for the slice. |
+| `nv_mma_shared_layout_to_ir_fix` | `types.nv_mma_shared_layout_encoding.to_ir` calls a stale `make_nv_mma_shared_encoding_attr` that no longer exists on `GluonOpBuilder`. Replace with `get_nvmma_shared_layout(swizzle_byte_width, element_bitwidth, transposed, fp4_padded, cga_layout, rank)`, mirroring `NVMMASharedLayout._to_ir`. ~30-line fix including the swizzle-byte-width derivation from shape×elemtype. |
 
 ### `utlx-cpp` — fix in next wheel rebuild (C++)
 
@@ -487,6 +575,7 @@ Highest leverage; smallest cost. Each retires one or more patches.
 |--------------------------------|------------------------------------------------------------------|
 | `dispatch_visit_with`          | A public extension hook for `with`-statement dispatch in `CodeGenerator.visit_With`, so plugins can register handlers without monkey-patching. Until then, the patch is the only option. |
 | `broadcast_shape_overload`     | Disappears once `gluon_op_builder_swap` is retired (no swap → no overload conflict). If the swap stays, upstream Triton would need to make `GluonOpBuilder.create_broadcast` accept either a shape list or an `ir.type`. |
+| TMA `eviction_policy` (and `cache_modifier`) | Two upstream changes prototyped on local branch `wychi/tma-eviction-policy` in `~/oss/triton` (commit `890498160`): (a) `python/src/gluon_ir.cc` — extend `create_async_tma_copy_global_to_local` pybind to take optional `cache=`/`evict=` kwargs; (b) `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp` — `AsyncTMACopyGlobalToLocalOpConversion` calls `createCachePolicy` (already in-tree) and emits `.L2::cache_hint` on `cp.async.bulk.tensor`. Verified end-to-end on H100; PTX dump shows `createpolicy.fractional.L2::evict_last.b64` + `cp.async.bulk.tensor.<rank>d.shared::cta.global.L2::cache_hint.mbarrier::complete_tx::bytes`. **Empirically: ~0% e2e gain on the trimul matmul** (B_g ~480 KB already enjoys natural L2 reuse from the round-robin scheduler) — kept in-tree as a wheel feature for cases where the working set actually thrashes L2. |
 
 ### Key files
 
