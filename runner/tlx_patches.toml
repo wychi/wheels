@@ -59,4 +59,10 @@ patches = [
     "gluon_op_builder_swap",
     "async_load_native",
     "warp_specialize_codegen",
+    # iter21 retry (post-PLAN_v5 audit): the gluon binding does accept
+    # `cache=` and `evict=` kwargs in the installed Triton 3.7.0 wheel
+    # (the iter21 audit was outdated). Plumbs them through uTLX's
+    # `async_descriptor_load`. Required for kernels that pass
+    # `eviction_policy="evict_last"` on read-only TMA loads.
+    "async_descriptor_load_eviction_policy",
 ]
