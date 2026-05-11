@@ -437,7 +437,6 @@ def _make_tensor_descriptor() -> None:
         return swizzle
 
     @tl_core.builtin
-    @functools.wraps(utlx_plugin.make_tensor_descriptor)
     def _patched(desc_ptr=None,
                  base=None,
                  shape=None,
@@ -472,9 +471,13 @@ def _make_tensor_descriptor() -> None:
         element_bitwidth = elt_ty.primitive_bitwidth
         rank = len(block_shape)
         swizzle = _default_nvmma_swizzle(block_shape, element_bitwidth)
+        # iter34a (trimul bmm): per-call `transposed=True` for the fp32
+        # C-buffer descriptor; default false keeps inputs unchanged.
+        transposed = bool(
+            tl_core._unwrap_if_constexpr(kwargs.pop("transposed", False)))
         layout_attr = builder.get_nvmma_shared_layout(swizzle,
                                                      element_bitwidth,
-                                                     False, False, [], rank)
+                                                     transposed, False, [], rank)
         result_ty = builder.get_tensor_descriptor_layout_type(
             block_type.to_ir(builder), is_signed_int, layout_attr)
         handle = _gluon_create_mtd(builder, result_ty, base.handle,

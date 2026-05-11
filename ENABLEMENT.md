@@ -7,7 +7,7 @@ This document tracks uTLX enablement work — bugs found, fixes applied, and pat
 - [`f3d635af`](#f3d635af) — Initial wheel, requires full bridge layer
 - [`1d7b7482`](#1d7b7482) — Built but never evaluated; superseded by `47debefa`
 - [`47debefa`](#47debefa) — Same patch surface as `f3d635af`; `make_tensor_descriptor` extended to embed shared-layout into descriptor type for TMA loads (`hopper_ws.py`); `tlx.release_layout` wall and acc-loop trade-off remain
-- [`cba4ef9a`](#cba4ef9a) — **Current wheel.** `tlx.release_layout` wall removed (C++ `TLXLayoutMarkerPattern` lowers markers to `ttg.convert_layout`); `mma_ops.async_dot` rewritten to preserve loop-carry acc; `mem_ops.make_tensor_descriptor` emits gluon binding with NVMMASharedLayout. Two patches retired (`make_tensor_descriptor`, `wgmma_acc_layout_setup`). `kernels/hopper_ws.py` and `kernels/tiny_gemm.py` both pass end-to-end.
+- [`cba4ef9a`](#cba4ef9a) — **Current wheel.** `tlx.release_layout` wall removed (C++ `TLXLayoutMarkerPattern` lowers markers to `ttg.convert_layout`); `mma_ops.async_dot` rewritten to preserve loop-carry acc; `mem_ops.make_tensor_descriptor` emits gluon binding with NVMMASharedLayout. Two patches retired (`make_tensor_descriptor`, `wgmma_acc_layout_setup`). `kernels/hopper_ws.py` and `kernels/tiny_gemm.py` both pass end-to-end. Open issues: TMA `eviction_policy` plumbing (resolved with local Triton patch), `tlx.local_slice` on contig-dim slices (partial), [`tl.split` segv on fp32 wgmma C-fragment tensors](#follow-up-tlsplit-segfaults-on-fp32-wgmma-derived-tensors-2026-05-11) (blocks S3-style `EPILOGUE_SUBTILE`).
 
 ---
 
@@ -484,6 +484,81 @@ dim that breaks naive `local_store` of a `[BM, BK]` source — the wheel
 expects multi-buffer indexing patterns). Documented as TODO; no kernel
 work currently depends on it.
 
+### Follow-up: `tl.split` segfaults on fp32 wgmma-derived tensors (2026-05-11)
+
+While porting S3's `EPILOGUE_SUBTILE` pattern into the trimul `bmm`
+kernel (iter34b — split the [BLOCK_M_SPLIT, BN] = [64, 128] fp32 wgmma
+accumulator into two BN/2 halves for two TMA stores), `tl.split` segvs
+during AST→TTIR compilation.
+
+**Symptom (faulthandler stack):**
+```
+Fatal Python error: Segmentation fault
+  File ".../triton/language/semantic.py", line 692 in split
+  File ".../triton/language/core.py", line 2142 in split
+  File ".../triton/compiler/code_generator.py", line 1394 in call_Function
+  ...
+  File ".../triton/compiler/code_generator.py", line 959 in visit_If
+  File ".../triton/compiler/code_generator.py", line 1094 in visit_While
+```
+
+The crash is in the C++ binding `builder.create_split(a.handle)`
+(`semantic.py:692`). `_find_carries` is walking the trial `visit_If`
+inside the consumer `while tile_id < num_tiles:` loop and trips on the
+split call.
+
+**Reproducer (minimal — toggle `EPILOGUE_SUBTILE=True` on the
+existing S3 config and run any kernel that hits S3):**
+```python
+# matmul_kernel_tlx_ws (S3) consumer warpgroup, lines ~1753-1758
+acc = tl.reshape(acc, (BLOCK_M_SPLIT, 2, BN // 2))
+acc = tl.permute(acc, (0, 2, 1))
+acc0, acc1 = tl.split(acc)        # ← segv here on fp32 wgmma acc
+```
+
+Confirmed **not iter34-specific.** Setting S3's existing untouched
+`TLX_CONFIG["EPILOGUE_SUBTILE"] = True` (line 1782) — code in tree
+since the iter15 era — crashes at the same line. The pattern was
+authored but never exercised in production runs because every
+`TLX_CONFIG` shipping default kept `EPILOGUE_SUBTILE = False`.
+
+**Diagnosis:** `tl.split` requires the last dim of its input to equal
+2; the C++ side then halves along that dim. The wgmma C-fragment for
+fp32 has a per-lane register tiling that doesn't naturally map under
+the `reshape(M, 2, N/2) → permute(M, N/2, 2) → split` rewrite.
+Whatever layout-inference path `create_split` uses on a wgmma-rooted
+tensor with a 2-element trailing dim hits a null deref or invalid
+state. (S3 with bf16 wgmma C may also crash — not confirmed; both
+S3 and bmm in our trimul build chose fp32 deliberately for cauchy
+precision.)
+
+**Workarounds (none of them clean enough to commit yet):**
+- **Manual smem staging** — `tlx.local_alloc((BLOCK_M_SPLIT, BN), fp32)`,
+  `tlx.local_store(slab, acc)`, then issue 2 TMA stores from
+  `tlx.local_slice` halves. Bypasses `tl.split` entirely. Blocked by
+  the [`local_slice` C++ binding issue](#follow-up-tlxlocal_slice-c-binding-fix-2026-05-08-partial)
+  for slicing on the contiguous dim with the swizzle already fitted
+  to the parent.
+- **Two separate WGMMAs** — restructure the inner loop so each
+  consumer WG runs two `[BLOCK_M_SPLIT, BN/2]` async_dots back to
+  back. No `split` needed. Bigger restructure; ~half-day.
+- **Skip subtile entirely** — go directly to register→TMA store
+  (iter34c-style "skip the smem epilogue"). Avoids both `split` and
+  `local_slice`.
+
+**Fix classification:** `triton` (C++ layout-inference in
+`create_split` for wgmma-rooted block tensors). The Python wrapper at
+`semantic.py:685-696` is a thin pass-through; the bug is below that
+in MLIR-land. Filing upstream is appropriate; the in-tree workaround
+is to avoid `tl.split` on wgmma C-fragment tensors and use one of the
+alternatives above.
+
+**Net effect on iter34:** the planned-as-cheap iter34b lever
+(EPILOGUE_SUBTILE port) is unreachable in its planned form on this
+wheel. iter34a (transposed-swizzle flip on the C descriptor) shipped
+its bmm-only -9.8% NCU duration win standalone; the next attempt at
+the same goal will go via manual smem staging or direct register→TMA.
+
 ---
 
 ## Enablement Workflow
@@ -726,6 +801,10 @@ These tests are excluded from the core test suite:
 ### `desc_ptr must be None or tlx.tensor_descriptor_ptr, got <class 'triton.language.core.constexpr'>`
 - **Cause:** The constexpr unwrap shim is missing; arg defaulted to `None` got wrapped by the JIT
 - **Fix:** Ensure `semantic_shims` patch is active (provides `tl._unwrap_if_constexpr`)
+
+### `Fatal Python error: Segmentation fault` in `semantic.py:692 in split` / `create_split`
+- **Cause:** `tl.split` C++ binding segvs on fp32 wgmma C-fragment tensors after `reshape→permute`. Affects every kernel that tries S3-style `EPILOGUE_SUBTILE` on a wgmma accumulator.
+- **Fix:** Avoid `tl.split` on wgmma-rooted tensors. Either stage through smem and `tlx.local_slice`, or restructure to two smaller WGMMAs, or do the BN-half stores via direct register→TMA. Full writeup: [`cba4ef9a` → `tl.split` segfaults follow-up](#follow-up-tlsplit-segfaults-on-fp32-wgmma-derived-tensors-2026-05-11)
 
 ---
 
